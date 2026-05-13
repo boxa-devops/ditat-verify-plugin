@@ -1,0 +1,15 @@
+{
+  "name": "ditat-tools",
+  "owner": {
+    "name": "Ditat ops",
+    "email": "boxa.devops@gmail.com"
+  },
+  "description": "Ditat TMS automation plugins.",
+  "plugins": [
+    {
+      "name": "ditat-verify",
+      "source": "./",
+      "description": "Pull unprocessed Ditat TMS shipments, download BOL/POD/Rate-Confirmation PDFs, cross-check fields against the Rate Confirmation and Ditat shipment record, write per-shipment markdown reports."
+    }
+  ]
+}

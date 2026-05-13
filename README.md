@@ -4,15 +4,27 @@ Pulls unprocessed shipments from Ditat TMS, downloads BOL/POD/Rate-Confirmation 
 
 ## Install
 
+This repo is a self-marketplace. Two-step install:
+
 ```
-/plugin install <git-url>
+/plugin marketplace add boxa-devops/ditat-verify-plugin
+/plugin install ditat-verify@ditat-tools
 ```
-or local path:
+
+For local testing before push:
 ```
-/plugin install <path-to-this-dir>
+/plugin marketplace add C:\Users\imoma\OneDrive\Рабочий стол\ditat-verify-plugin
+/plugin install ditat-verify@ditat-tools
 ```
 
 A `SessionStart` hook will `pip install -r scripts/requirements.txt` on first activation. Re-installs only when `requirements.txt` changes.
+
+## Update
+
+```
+/plugin marketplace update ditat-tools
+/plugin update ditat-verify@ditat-tools
+```
 
 ## Setup (per user)
 
