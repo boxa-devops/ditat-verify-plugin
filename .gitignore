@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local test artifacts (state always lives in user's project dir, not here)
+state.db
+state.db-wal
+state.db-shm
+.ditat_token_*.json
+downloads/
+reports/
+.env
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
