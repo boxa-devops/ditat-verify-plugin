@@ -310,6 +310,160 @@ def cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _select_report_paths(args: argparse.Namespace) -> list[Path]:
+    """Pick which .md reports to bundle into the docx."""
+    if args.keys:
+        keys = [k.strip() for k in args.keys.split(",") if k.strip()]
+        return [REPORTS_DIR / f"{k}.md" for k in keys]
+
+    conn = db_connect()
+    if args.since_days is not None:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=args.since_days)).isoformat()
+        cur = conn.execute(
+            "SELECT shipment_key, report_path FROM processed_shipments "
+            "WHERE processed_at >= ? ORDER BY processed_at",
+            (cutoff,),
+        )
+    else:
+        cur = conn.execute(
+            "SELECT shipment_key, report_path FROM processed_shipments ORDER BY processed_at"
+        )
+    rows = cur.fetchall()
+    conn.close()
+
+    paths: list[Path] = []
+    for key, rpath in rows:
+        if rpath:
+            p = Path(rpath)
+            if not p.is_absolute():
+                p = _state_root() / p
+        else:
+            p = REPORTS_DIR / f"{key}.md"
+        if p.exists():
+            paths.append(p)
+    return paths
+
+
+def _md_to_docx(paths: list[Path], out_path: Path) -> None:
+    """Render markdown reports into one .docx. Minimal MD subset only (headings,
+    lists, fenced code, bold). Keeps it dependency-light and stable."""
+    from docx import Document
+    from docx.shared import Pt
+
+    doc = Document()
+    doc.core_properties.title = "Ditat Verification Report"
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(11)
+
+    title = doc.add_heading("Ditat Verification Report", level=0)
+    doc.add_paragraph(
+        f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}  "
+        f"| Shipments: {len(paths)}"
+    )
+
+    for i, p in enumerate(paths):
+        if i > 0:
+            doc.add_page_break()
+        _render_md_into(doc, p.read_text(encoding="utf-8"))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(out_path)
+
+
+def _render_md_into(doc, md: str) -> None:
+    """Tiny markdown → docx renderer for our report format."""
+    import re
+    in_code = False
+    code_buf: list[str] = []
+    bold_re = re.compile(r"\*\*(.+?)\*\*")
+
+    def flush_code():
+        nonlocal code_buf
+        if not code_buf:
+            return
+        p = doc.add_paragraph()
+        run = p.add_run("\n".join(code_buf))
+        run.font.name = "Consolas"
+        from docx.shared import Pt
+        run.font.size = Pt(9)
+        code_buf = []
+
+    def add_inline(par, text: str):
+        pos = 0
+        for m in bold_re.finditer(text):
+            if m.start() > pos:
+                par.add_run(text[pos:m.start()])
+            r = par.add_run(m.group(1))
+            r.bold = True
+            pos = m.end()
+        if pos < len(text):
+            par.add_run(text[pos:])
+
+    for raw in md.splitlines():
+        line = raw.rstrip()
+        if line.startswith("```"):
+            if in_code:
+                flush_code()
+                in_code = False
+            else:
+                in_code = True
+            continue
+        if in_code:
+            code_buf.append(raw)
+            continue
+        if not line.strip():
+            doc.add_paragraph("")
+            continue
+        if line.startswith("### "):
+            doc.add_heading(line[4:], level=3)
+        elif line.startswith("## "):
+            doc.add_heading(line[3:], level=2)
+        elif line.startswith("# "):
+            doc.add_heading(line[2:], level=1)
+        elif line.lstrip().startswith(("- ", "* ")):
+            indent = len(line) - len(line.lstrip())
+            text = line.lstrip()[2:]
+            par = doc.add_paragraph(style="List Bullet")
+            if indent >= 2:
+                par.paragraph_format.left_indent = None
+            add_inline(par, text)
+        else:
+            par = doc.add_paragraph()
+            add_inline(par, line)
+    flush_code()
+
+
+def cmd_build_docx(args: argparse.Namespace) -> int:
+    paths = _select_report_paths(args)
+    if not paths:
+        print(json.dumps({"error": "no reports matched"}), file=sys.stderr)
+        return 1
+
+    if args.output:
+        out = Path(args.output)
+        if not out.is_absolute():
+            out = _state_root() / out
+    else:
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        out = REPORTS_DIR / f"ditat-verify-{stamp}.docx"
+
+    try:
+        _md_to_docx(paths, out)
+    except ImportError:
+        print(json.dumps({
+            "error": "python-docx not installed. Run: pip install -r scripts/requirements.txt"
+        }), file=sys.stderr)
+        return 2
+
+    print(json.dumps({
+        "docx": str(out.resolve()),
+        "shipments": len(paths),
+        "sources": [str(p) for p in paths],
+    }, indent=2))
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Ditat shipment verification helper")
     p.add_argument("--verbose", action="store_true")
@@ -347,6 +501,15 @@ def main() -> int:
 
     e = sub.add_parser("check-env", help="Validate .env / credentials without API calls")
     e.set_defaults(func=cmd_check_env)
+
+    b = sub.add_parser("build-docx", help="Bundle markdown reports into one .docx")
+    b.add_argument("--since-days", type=int, default=None,
+                   help="Include reports processed in the last N days (default: all)")
+    b.add_argument("--keys", default=None,
+                   help="Comma-separated shipment_keys to include (overrides --since-days)")
+    b.add_argument("--output", default=None,
+                   help="Output .docx path (default: reports/ditat-verify-<date>.docx)")
+    b.set_defaults(func=cmd_build_docx)
 
     args = p.parse_args()
     setup_logging(args.verbose)

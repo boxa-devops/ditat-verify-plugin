@@ -5,7 +5,7 @@ description: Pull unprocessed shipments from Ditat TMS, download their documents
 
 # Ditat Shipment Verification
 
-Goal: for every shipment not yet processed in `state.db`, read its BOL, POD, and Rate Confirmation PDFs, then flag any field that disagrees between (a) BOL ↔ Rate Con, (b) POD ↔ Rate Con, and (c) Ditat shipment record ↔ Rate Con. Output one markdown report per shipment, mark shipment processed in `state.db`.
+Goal: for every shipment not yet processed in `state.db`, read its BOL, POD, and Rate Confirmation PDFs, then flag any field that disagrees between (a) BOL ↔ Rate Con, (b) POD ↔ Rate Con, and (c) Ditat shipment record ↔ Rate Con. Write one per-shipment markdown report (audit trail), mark shipment processed in `state.db`, then bundle the batch into a single Word doc the user can review or forward.
 
 ## Paths
 
@@ -145,14 +145,31 @@ python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" mark <shipment_key> --s
 ```
 Mark only after report exists. If docs were missing and diffs skipped, still mark with `--critical 0 --warn 0` so the shipment isn't reprocessed every run.
 
-### 6. Roll up to user
+### 6. Bundle batch into one Word doc
 
-After the batch, print a short table to chat:
+After the batch finishes (all marks done), package the freshly written reports into a single `.docx`:
+
+PowerShell:
+```
+python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" build-docx --keys <key1,key2,...>
+```
+
+Use `--keys` with the comma-separated shipment_keys you just processed so the doc matches *this* batch. Other flags:
+- `--since-days N` → include every report processed in the last N days (for retro bundling, e.g. weekly digest)
+- `--output <path>` → custom output path; default is `${CLAUDE_PROJECT_DIR}/reports/ditat-verify-<YYYY-MM-DD>.docx`
+
+Helper prints JSON `{ "docx": "<absolute path>", "shipments": N, "sources": [...] }`.
+
+### 7. Roll up to user
+
+Print a short table plus the docx path:
 
 ```
 shipment_id        critical  warn   report
 SH-0000009584      2         3      reports\9536.md
 SH-0000009585      0         1      reports\9537.md
+
+→ Bundle: reports\ditat-verify-2026-05-13.docx
 ```
 
 ## Sub-commands user may invoke directly
@@ -161,6 +178,7 @@ SH-0000009585      0         1      reports\9537.md
 - `verify shipment <KEY>` / `re-verify shipment <KEY>` → `verify-one <KEY>`, full flow. `mark` is INSERT-OR-REPLACE, no need for `reset`.
 - `ditat verify status` → `status` subcommand
 - `ditat env check` → `check-env`
+- `bundle last N days` / `weekly digest` → `build-docx --since-days N` (no API calls, just packages existing reports)
 
 ## Operational notes
 
