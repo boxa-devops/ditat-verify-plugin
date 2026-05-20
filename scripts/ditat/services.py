@@ -263,8 +263,13 @@ class DocumentService:
             filename = self._extract_filename(resp, doc, doc_key)
             out_dir.mkdir(parents=True, exist_ok=True)
             out_path = out_dir / filename
-            out_path.write_bytes(resp.content)
-            log.info("Downloaded %d bytes (CT=%s) → %s", len(resp.content), ct, out_path)
+            total = 0
+            with out_path.open("wb") as fh:
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        fh.write(chunk)
+                        total += len(chunk)
+            log.info("Downloaded %d bytes (CT=%s) → %s", total, ct, out_path)
             return out_path
 
         log.warning("Download %s returned HTTP %s CT=%s — falling back to inline content",

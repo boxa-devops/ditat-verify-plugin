@@ -1,23 +1,49 @@
 ---
 name: ditat-verify
-description: Pull unprocessed shipments from Ditat TMS, download their documents (BOL/POD/Rate Confirmation), and cross-check BOL+POD+Ditat shipment fields against the Rate Confirmation. Produces a per-shipment markdown report and marks the shipment processed. Trigger when user says "verify ditat shipments", "check ditat", "run ditat verification", "/ditat-verify", or asks to reconcile shipment documents against rate cons.
+description: Pull unprocessed shipments from Ditat TMS, download their documents (BOL/POD/Rate Confirmation), and cross-check BOL+POD+Ditat shipment fields against the Rate Confirmation. Produces ONE batch Word doc (.docx) listing only problematic shipments and marks every processed shipment in state.db. Trigger when user says "verify ditat shipments", "check ditat", "run ditat verification", "/ditat-verify", or asks to reconcile shipment documents against rate cons.
 ---
 
 # Ditat Shipment Verification
 
-Goal: for every shipment not yet processed in `state.db`, read its BOL, POD, and Rate Confirmation PDFs, then flag any field that disagrees between (a) BOL ↔ Rate Con, (b) POD ↔ Rate Con, and (c) Ditat shipment record ↔ Rate Con. Write one per-shipment markdown report (audit trail), mark shipment processed in `state.db`, then bundle the batch into a single Word doc the user can review or forward.
+## How to use this skill
+
+**What it does.** For every shipment in a time window that hasn't already been processed, downloads its PDFs (BOL / POD / Rate Confirmation), extracts the key fields from each, cross-checks them against the Ditat shipment record AND against the Rate Confirmation, and emits **one Word document** with:
+- a summary table of all shipments in the batch (verdict per row), and
+- a detail section for **problematic shipments only** (critical findings, warnings, or RC missing).
+
+Every shipment processed is marked in `state.db` so it won't be re-checked on the next run.
+
+**The output the user cares about.** A single `.docx` file at `${CLAUDE_PROJECT_DIR}/reports/ditat-verify-<stamp>.docx`. The skill prints the absolute path at the end. **No per-shipment `.md` files** are produced — the docx is the deliverable.
+
+**Triggers.** Run this skill when the user says any of:
+- `verify ditat shipments`, `check ditat`, `run ditat verification`, `/ditat-verify`
+- `verify last week` / `verify last month` / `verify last N days`
+- `verify shipment <KEY>` / `re-verify shipment <KEY>` (single-shipment retry)
+- `ditat env check` / `ditat verify status`
+- "reconcile shipment docs against rate cons" or anything semantically equivalent
+
+**Inputs.** Just a time window (defaults to last month if user said nothing). Credentials come from `${CLAUDE_PROJECT_DIR}/.env`.
+
+**Outputs.**
+1. `${CLAUDE_PROJECT_DIR}/reports/ditat-verify-<YYYY-MM-DD-HHMM>.docx` — the deliverable.
+2. Updated `state.db` rows for every shipment processed.
+3. A short table printed in chat: shipment_id, verdict, critical_count, warn_count → docx path.
+
+**Reusable as a building block.** Each helper sub-command (`check-env`, `fetch`, `verify-one`, `finalize`, `status`, `reset`, `mark`) prints JSON on stdout and logs on stderr, so it can be piped or invoked from another skill. The Python modules `ditat.diff` and `ditat.docx_report` are import-safe and stateless.
 
 ## Paths
 
-- **Helper script** lives inside the plugin: `${CLAUDE_PLUGIN_ROOT}/scripts/ditat_verify.py`. Always invoke with the full `${CLAUDE_PLUGIN_ROOT}` path so it works no matter where the user's project is.
-- **State (`state.db`, `reports/`, `downloads/`, token cache, `.env`)** lives in the user's project: `${CLAUDE_PROJECT_DIR}`. The script auto-resolves these from `$CLAUDE_PROJECT_DIR` so plugin updates never wipe operational data.
-- **`.env`** must exist at `${CLAUDE_PROJECT_DIR}/.env` with `DITAT_BASE_URL`, `DITAT_ACCOUNT_ID`, `DITAT_CLIENT_ID`, `DITAT_CLIENT_SECRET`. See `${CLAUDE_PLUGIN_ROOT}/.env.example` for the template.
+- **Helper script:** `${CLAUDE_PLUGIN_ROOT}/scripts/ditat_verify.py` — always invoke with the full `${CLAUDE_PLUGIN_ROOT}` path so plugin updates don't break it.
+- **State** (`state.db`, `reports/`, `downloads/`, token cache, `.env`, `.ditat_batch.json`) lives in `${CLAUDE_PROJECT_DIR}` and is auto-resolved by the helper.
+- **`.env`** must exist at `${CLAUDE_PROJECT_DIR}/.env` with `DITAT_BASE_URL`, `DITAT_ACCOUNT_ID`, `DITAT_CLIENT_ID`, `DITAT_CLIENT_SECRET`. Template at `${CLAUDE_PLUGIN_ROOT}/.env.example`.
 
-Run commands from the user's current shell — `cwd` is `${CLAUDE_PROJECT_DIR}` so relative downloads (`./downloads`) land in the right place.
+Run from the user's current shell — `cwd` is `${CLAUDE_PROJECT_DIR}`.
 
-## Flow
+## The flow — 4 sequential turns total
 
-### 0. Preflight (first run of session only)
+The skill collapses the old per-shipment loop into a fixed 4-step pipeline regardless of batch size:
+
+### Step 1 — Preflight (first run of session only)
 
 PowerShell:
 ```
@@ -28,167 +54,164 @@ Bash:
 python "$CLAUDE_PLUGIN_ROOT/scripts/ditat_verify.py" check-env
 ```
 
-If `ok: false`, tell user to copy `${CLAUDE_PLUGIN_ROOT}/.env.example` to `${CLAUDE_PROJECT_DIR}/.env` and fill credentials. Skip on repeat invocations in same session.
+If `ok: false`, tell the user to copy `${CLAUDE_PLUGIN_ROOT}/.env.example` to `${CLAUDE_PROJECT_DIR}/.env` and fill credentials. Skip on repeat invocations in the same session.
 
-### 1. Fetch unprocessed shipments
-```
-python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" fetch --limit 5
-```
-Optional flags: `--since-days N` (default 30), `--all` (no date filter), `--include-processed` (re-verify).
+### Step 2 — Fetch (single helper call)
 
-Helper downloads docs to `${CLAUDE_PROJECT_DIR}/downloads/<shipment_key>/` and prints JSON on stdout:
+```
+python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" fetch --last-month
+```
+Flags:
+- `--last-week` / `--last-month` — presets (7 / 30 days)
+- `--since-days N` — custom window
+- `--limit N` — cap (default 500)
+- `--all` — no date filter
+- `--include-processed` — re-verify already-marked shipments
+- `--workers N` — across-shipment parallelism (default 5)
+- `--doc-workers N` — per-shipment doc-download parallelism (default 3)
+
+Default mapping:
+- "verify last week" → `--last-week`
+- "verify last month" or unspecified → `--last-month`
+- "verify next N shipments" → `--limit N`
+- Single-shipment retry → use `verify-one <KEY>` instead (same envelope, batch of 1).
+
+Helper downloads docs in parallel and prints slim JSON on stdout:
 ```json
 {
   "count": N,
+  "batch_sidecar": ".../.ditat_batch.json",
   "shipments": [
     {
       "shipment_key": "9536",
-      "shipment_id": "SH-0000009584",
+      "shipment_id":  "SH-0000009584",
       "ditat_fields": { "bol_number": ..., "load_number": ..., "total_weight_lbs": ..., "pickup": {...}, "delivery": {...}, ... },
       "documents": [
-        { "doc_key": "...", "file_name": "...", "file_type": "...", "path": "<absolute path>" }
+        { "classification": "RC|BOL|POD|UNKNOWN", "file_name": "...", "path": "<absolute>" }
       ]
     }
   ]
 }
 ```
 
-If `count == 0`: tell user "no unprocessed shipments" and stop.
+If `count == 0`: tell the user "no unprocessed shipments" and stop. **Do not call `finalize`.**
 
-### 2. Per shipment — read + classify docs
+### Step 3 — Read PDFs + write findings (single agent turn)
 
-For each shipment in the JSON, read each `documents[].path` with the Read tool. Classify each into:
+For each shipment in the JSON, in **one message**, fire all PDF `Read` tool calls in parallel — every document path across every shipment, all in the same turn. The `classification` hint tells you which doc is RC vs BOL vs POD, but re-classify from content if the hint is `UNKNOWN` or looks wrong.
 
-- **RC** (Rate Confirmation) — carrier/agreed rate, load number, equipment, pickup/delivery scheduled dates
-- **BOL** (Bill of Lading) — bol number, shipper/consignee, weight, pieces, commodity, PO numbers
-- **POD** (Proof of Delivery) — signed-by, delivery date/time, pieces received, weight received, damages
-- **OTHER** — invoice, photos, accessorial — log type only, no field diff
+Extract these fields per doc type:
 
-Classify by document content. Filename hints help but are not authoritative.
+| RC                   | BOL                       | POD                  |
+|----------------------|---------------------------|----------------------|
+| load_number          | bol_number                | bol_number           |
+| agreed_rate          | shipper {city, state}     | delivery_date        |
+| pickup_date          | consignee {city, state}   | signed_by            |
+| delivery_date        | pickup_date               | pieces_received      |
+| equipment_type       | delivery_date             | weight_received_lbs  |
+| pickup_location {city, state} | weight_lbs       | damages_notes        |
+| delivery_location {city, state} | pieces        |                      |
+| commodity            | commodity                 |                      |
+|                      | po_numbers, hazmat        |                      |
 
-Extract these fields from each:
+After all reads complete, **write one combined findings file** to `${CLAUDE_PROJECT_DIR}/.ditat_findings.json`:
 
-| RC                   | BOL                  | POD                  |
-|----------------------|----------------------|----------------------|
-| load_number          | bol_number           | bol_number           |
-| agreed_rate          | shipper (name/city/state) | delivery_date    |
-| pickup_date          | consignee (name/city/state) | delivery_time |
-| delivery_date        | pickup_date          | signed_by            |
-| equipment_type       | delivery_date        | pieces_received      |
-| pickup_location      | weight_lbs           | weight_received_lbs  |
-| delivery_location    | pieces               | damages_notes        |
-| commodity            | commodity            |                      |
-|                      | po_numbers           |                      |
-|                      | hazmat               |                      |
-
-If a shipment has **no RC**, cannot diff against rate confirmation — still produce a report stating "RC missing; can only do BOL↔POD↔Ditat cross-check." If only one doc, note it and skip cross-checks that need the other.
-
-### 3. Diff & severity
-
-RC is contractual source of truth; Ditat is system-of-record snapshot.
-
-**Tolerances**
-- Weight: critical if delta > 5%, warn if 1–5%, info if <1%
-- Dates: critical if delta > 1 day, warn if delta > 0 but ≤ 1 day
-- Money: critical if delta > $1.00 or > 1%
-- Strings: normalize (lowercase, strip, collapse whitespace) before compare; warn on mismatch
-- Missing on one side: warn
-
-**Cross-checks per shipment**
-1. **BOL ↔ RC**: bol_number presence, pickup_date, delivery_date, weight, pieces, commodity, locations (pickup city/state, delivery city/state)
-2. **POD ↔ RC**: delivery_date (POD actual vs RC scheduled), weight_received vs RC/BOL weight, pieces_received vs BOL pieces, bol_number match
-3. **Ditat ↔ RC**: bol_number, load_number, total_weight_lbs, total_pieces, equipment_type, pickup city/state, delivery city/state, agreed_rate vs total_revenue
-4. **BOL ↔ POD**: bol_number match, weight delivered vs weight shipped, pieces delivered vs pieces shipped
-
-### 4. Write report
-
-Write to `${CLAUDE_PROJECT_DIR}/reports/<shipment_key>.md`:
-
-```markdown
-# Shipment <shipment_id> (key=<shipment_key>) — Verification Report
-Generated: <UTC timestamp>
-
-## Documents
-- RC:  <filename> (doc_key=...)
-- BOL: <filename> (doc_key=...)
-- POD: <filename> (doc_key=...)
-- OTHER: <filename> — <type>
-
-## Summary
-- Critical: N
-- Warnings: N
-- Info:     N
-
-## Findings
-
-### CRITICAL
-- **[BOL↔RC] weight_lbs**: BOL=42000, RC=24000 → delta 75% > 5% tolerance.
-- **[POD↔RC] delivery_date**: POD=2026-05-10, RC=2026-05-08 → 2-day gap.
-
-### WARN
-- **[Ditat↔RC] equipment_type**: Ditat="Reefer", RC="Refrigerated Van" — likely same, normalize.
-- **[BOL↔RC] po_numbers**: BOL has PO 12345 not on RC.
-
-### INFO
-- **[BOL↔POD] pieces**: 24 vs 24 — match.
-
-## Extracted fields
-<one block per doc with all extracted fields, for audit>
-
-## Ditat shipment snapshot
-<the ditat_fields object from helper, pretty-printed>
+```json
+{
+  "shipments": [
+    {
+      "shipment_key": "9536",
+      "shipment_id":  "SH-0000009584",
+      "extracted": {
+        "rc":  { "load_number": "...", "agreed_rate": 1500.00, "pickup_date": "2026-05-01",
+                 "delivery_date": "2026-05-03", "equipment_type": "Reefer",
+                 "pickup_location":   { "city": "...", "state": "..." },
+                 "delivery_location": { "city": "...", "state": "..." },
+                 "commodity": "...", "weight_lbs": 42000, "pieces": 24 },
+        "bol": { "bol_number": "...", "weight_lbs": 42000, "pieces": 24,
+                 "pickup_date": "...", "delivery_date": "...",
+                 "shipper":   { "city": "...", "state": "..." },
+                 "consignee": { "city": "...", "state": "..." },
+                 "commodity": "..." },
+        "pod": { "bol_number": "...", "delivery_date": "...", "signed_by": "...",
+                 "pieces_received": 24, "weight_received_lbs": 41950,
+                 "damages_notes": null }
+      },
+      "docs_missing": []
+    }
+  ]
+}
 ```
 
-### 5. Mark processed
-```
-python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" mark <shipment_key> --shipment-id "<id>" --report-path "reports\<shipment_key>.md" --critical <N> --warn <N>
-```
-Mark only after report exists. If docs were missing and diffs skipped, still mark with `--critical 0 --warn 0` so the shipment isn't reprocessed every run.
+Rules for the agent:
+- **Do NOT diff in your head.** The helper's `finalize` step runs the deterministic diff in Python. Just extract the fields cleanly.
+- If a doc is missing or unreadable, omit that key from `extracted` and list the type in `docs_missing` (e.g. `["RC"]`).
+- Use ISO dates (`YYYY-MM-DD`) where possible. The diff module accepts common variants but ISO is safest.
+- For large PDFs, the first ~10 pages are almost always enough.
 
-### 6. Bundle batch into one Word doc
-
-After the batch finishes (all marks done), package the freshly written reports into a single `.docx`:
-
-PowerShell:
-```
-python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" build-docx --keys <key1,key2,...>
-```
-
-Use `--keys` with the comma-separated shipment_keys you just processed so the doc matches *this* batch. Other flags:
-- `--since-days N` → include every report processed in the last N days (for retro bundling, e.g. weekly digest)
-- `--output <path>` → custom output path; default is `${CLAUDE_PROJECT_DIR}/reports/ditat-verify-<YYYY-MM-DD>.docx`
-
-Helper prints JSON `{ "docx": "<absolute path>", "shipments": N, "sources": [...] }`.
-
-### 7. Roll up to user
-
-Print a short table plus the docx path:
+### Step 4 — Finalize (single helper call)
 
 ```
-shipment_id        critical  warn   report
-SH-0000009584      2         3      reports\9536.md
-SH-0000009585      0         1      reports\9537.md
-
-→ Bundle: reports\ditat-verify-2026-05-13.docx
+python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" finalize --findings-file .ditat_findings.json
 ```
+
+The helper does, in one transaction:
+1. Runs cross-checks in Python (BOL↔RC, POD↔RC, Ditat↔RC, BOL↔POD) with tolerances (weight Δ>5% critical, dates Δ>1d critical, money Δ>$1 critical, normalized string compare).
+2. Marks every shipment processed in `state.db`.
+3. Builds **one `.docx`** with a summary table + detail section for problematic shipments only.
+4. Deletes the batch sidecar.
+
+Output JSON:
+```json
+{
+  "docx": "<abs path>",
+  "processed": N,
+  "problematic": M,
+  "verdicts": { "OK": ..., "WARN": ..., "ISSUES": ..., "RC MISSING": ... },
+  "problem_shipments": [ { "shipment_id": "...", "verdict": "ISSUES", "critical": 2, "warn": 1 }, ... ]
+}
+```
+
+Flags:
+- `--output <path>` — override docx output location
+- `--keep-batch` — keep `.ditat_batch.json` (default: delete)
+- `--batch-file <path>` — override sidecar path (advanced)
+
+### Step 5 — Roll up to user
+
+Print a compact table (verdict-first ordering) and the docx path:
+
+```
+shipment_id        verdict       critical  warn
+SH-0000009584      ISSUES        2         3
+SH-0000009586      RC MISSING    0         1
+SH-0000009585      OK            0         0  ← not in detail section
+
+→ reports\ditat-verify-2026-05-13-1530.docx
+```
+
+That's it. **Net tool calls per batch: ~4 sequential turns** (preflight + fetch + Read-batch + finalize), independent of shipment count.
 
 ## Sub-commands user may invoke directly
 
+- `verify last week` → `fetch --last-week`, full flow
+- `verify last month` / `verify ditat shipments` → `fetch --last-month`, full flow
 - `verify next N shipments` → `fetch --limit N`, full flow
-- `verify shipment <KEY>` / `re-verify shipment <KEY>` → `verify-one <KEY>`, full flow. `mark` is INSERT-OR-REPLACE, no need for `reset`.
+- `verify shipment <KEY>` / `re-verify shipment <KEY>` → `verify-one <KEY>`, then `finalize` as a batch of 1. `mark` is INSERT-OR-REPLACE — no need to `reset` first.
 - `ditat verify status` → `status` subcommand
 - `ditat env check` → `check-env`
-- `bundle last N days` / `weekly digest` → `build-docx --since-days N` (no API calls, just packages existing reports)
 
 ## Operational notes
 
-- **Token budget**: Ditat enforces 12 token-fetches/hour. Helper reuses cached token at `${CLAUDE_PROJECT_DIR}/.ditat_token_*.json`. Don't loop `fetch` rapidly.
-- **Permission gap**: Ditat user may lack `documents` View role → docs list empty even when shipment has files. Helper logs warning; report says "no documents fetched (role may be missing)".
-- **Large PDF**: read first ~10 pages; BOL/POD/RC fields almost always sit on page 1.
-- **State location**: `state.db` lives in `${CLAUDE_PROJECT_DIR}`. Run `status` to inspect. Run `reset <key>` to force re-verification.
+- **Token budget.** Ditat enforces 12 token-fetches/hour. Helper reuses cached token at `${CLAUDE_PROJECT_DIR}/.ditat_token_*.json`. Workers share the same session, so concurrency does not multiply token fetches.
+- **Permission gap.** If the Ditat user lacks the `documents` View role, the docs list is empty even when files exist. Helper logs a warning; affected shipments will have empty `documents` and the docx will show them with the relevant doc marked `✗`.
+- **Large PDFs.** Stream first ~10 pages; BOL/POD/RC fields almost always live on page 1.
+- **Concurrent runs.** State.db uses WAL + busy_timeout=5s; two overlapping invocations won't corrupt state.
+- **`.ditat_batch.json`** is the bridge between `fetch` and `finalize`. It carries the full Ditat record for each shipment so `finalize` can run diffs without re-hitting the API. Delete it manually if a fetch was aborted.
 
 ## What this skill does NOT do
 
-- Write back to Ditat (project is read-only by design).
+- Write back to Ditat (read-only by design).
 - Send Slack/email alerts.
-- OCR image-only TIFFs (Read may fail; log "needs OCR" finding and move on).
+- OCR image-only PDFs — Read tool may fail on those; list the doc in `docs_missing` and move on.
+- Produce per-shipment `.md` files anymore. The docx is the only persistent report artifact.
