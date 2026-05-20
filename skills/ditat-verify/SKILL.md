@@ -96,9 +96,21 @@ Helper downloads docs in parallel and prints slim JSON on stdout:
 
 If `count == 0`: tell the user "no unprocessed shipments" and stop. **Do not call `finalize`.**
 
-### Step 3 — Read PDFs + write findings (single agent turn)
+### Step 3 — Read PDFs + write findings (parallel Reads, chunked if batch big)
 
-For each shipment in the JSON, in **one message**, fire all PDF `Read` tool calls in parallel — every document path across every shipment, all in the same turn. The `classification` hint tells you which doc is RC vs BOL vs POD, but re-classify from content if the hint is `UNKNOWN` or looks wrong.
+PDF extraction is done by **Claude via the Read tool** — not in Python. Python's role stays I/O + diff + docx. Reading PDFs with Claude tolerates the format variation across carriers/brokers far better than rule-based parsers, which is why this step lives in the agent.
+
+**Chunking policy** (important for performance and context):
+
+- **≤ 10 shipments** (≈30 PDFs): fire every `Read` in a single message, parallel. One turn, one findings file, done.
+- **11–25 shipments**: process in chunks of ~8 shipments per turn. Each turn = one message with all that chunk's Reads in parallel, then append that chunk's records to `${CLAUDE_PROJECT_DIR}/.ditat_findings.json`.
+- **> 25 shipments** (e.g. 54-shipment weekly run = ~162 PDFs): chunks of 5–8 shipments per turn. Each chunk is its own parallel-Read message.
+
+Within a chunk: fire **all** that chunk's PDF paths as parallel `Read` calls in a **single message** — do not loop one Read per turn. The whole point of the optimization is parallel reads inside one turn.
+
+After every chunk, write/update `${CLAUDE_PROJECT_DIR}/.ditat_findings.json` so progress is durable across context resets. Use the same `{ "shipments": [...] }` schema across chunks — re-read the file, append the new shipments' records, write it back.
+
+The `classification` hint in the fetch JSON tells you which doc is RC vs BOL vs POD, but re-classify from content if the hint is `UNKNOWN` or looks wrong.
 
 Extract these fields per doc type:
 
@@ -114,7 +126,7 @@ Extract these fields per doc type:
 | commodity            | commodity                 |                      |
 |                      | po_numbers, hazmat        |                      |
 
-After all reads complete, **write one combined findings file** to `${CLAUDE_PROJECT_DIR}/.ditat_findings.json`:
+After all chunks are done, the combined findings file at `${CLAUDE_PROJECT_DIR}/.ditat_findings.json` should look like:
 
 ```json
 {
@@ -190,7 +202,9 @@ SH-0000009585      OK            0         0  ← not in detail section
 → reports\ditat-verify-2026-05-13-1530.docx
 ```
 
-That's it. **Net tool calls per batch: ~4 sequential turns** (preflight + fetch + Read-batch + finalize), independent of shipment count.
+**Net sequential tool turns per batch:**
+- Tiny batch (≤10 shipments): ~4 turns (preflight + fetch + 1 parallel-Read turn + finalize).
+- Big batch (e.g. 54 shipments): ~10–14 turns (preflight + fetch + 7–11 parallel-Read chunks + finalize). Still dramatically fewer than the old per-shipment loop (~3N+2 = 164+ calls for 54 shipments).
 
 ## Sub-commands user may invoke directly
 
