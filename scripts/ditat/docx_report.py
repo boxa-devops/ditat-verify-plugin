@@ -164,8 +164,14 @@ def build_batch_docx(
     findings_index: dict,
     diff_index: dict,
     out_path: Path,
+    anomalies_only: bool = True,
 ) -> dict:
-    """Render the final docx. Returns counters for the helper to print."""
+    """Render the final docx. Returns counters for the helper to print.
+
+    anomalies_only=True (default) drops the per-shipment summary table —
+    docx contains only the counts header + detail sections for problematic
+    shipments. Set False to include the full summary table.
+    """
     doc = _init_doc()
     doc.add_heading("Ditat Verification Report", level=0)
 
@@ -202,10 +208,12 @@ def build_batch_docx(
         f"ISSUES: {counts.get('ISSUES', 0)}  ·  RC MISSING: {counts.get('RC MISSING', 0)}"
     ).italic = True
 
-    _add_summary_table(doc, summary_rows)
+    if not anomalies_only:
+        _add_summary_table(doc, summary_rows)
 
     if problematic_keys:
-        doc.add_page_break()
+        if not anomalies_only:
+            doc.add_page_break()
         doc.add_heading("Problematic shipments", level=1)
         # Build key→entry map once
         by_key = {e.get("shipment_key"): e for e in batch}

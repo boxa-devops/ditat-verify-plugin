@@ -2,15 +2,19 @@
 """Ditat shipment verification — CLI entrypoint.
 
 Sub-commands:
-  check-env  — validate .env / credentials without making API calls.
-  fetch      — list unprocessed shipments, download docs in parallel, emit
-               slim JSON, persist `.ditat_batch.json` sidecar for `finalize`.
-  verify-one — same shape as `fetch` but for a single shipment_key.
-  finalize   — consume agent findings + sidecar → diff + mark + ONE batch
-               .docx. Single transaction.
-  mark       — mark a single shipment processed (used by verify-one retry).
-  status     — show recent processed-shipment rows.
-  reset      — clear processed flag for a shipment.
+  check-env        — validate .env / credentials without making API calls.
+  fetch            — list unprocessed shipments, download docs in parallel,
+                     emit slim JSON, persist `.ditat_batch.json` sidecar AND
+                     pre-build `.ditat_findings.json` skeleton for `finalize`.
+  verify-one       — same shape as `fetch` but for a single shipment_key.
+  append-findings  — merge a chunk's extracted records into
+                     `.ditat_findings.json` atomically (replaces ad-hoc
+                     per-chunk Python the agent used to write).
+  finalize         — consume agent findings + sidecar → diff + mark + ONE
+                     batch .docx. Single transaction.
+  mark             — mark a single shipment processed (used by verify-one).
+  status           — show recent processed-shipment rows.
+  reset            — clear processed flag for a shipment.
 
 Stdout is JSON, stderr is logs.
 """
@@ -58,8 +62,67 @@ def _state_root() -> Path:
 STATE_DB = _state_root() / os.getenv("DITAT_STATE_DB_NAME", "state.db")
 REPORTS_DIR = Path(os.getenv("DITAT_REPORTS_DIR") or (_state_root() / "reports"))
 BATCH_SIDECAR = _state_root() / ".ditat_batch.json"
+FINDINGS_FILE = _state_root() / ".ditat_findings.json"
 
 MAX_FINDINGS_BYTES = 50 * 1024 * 1024  # 50 MB defensive cap
+
+
+# ---------------------------------------------------------------- findings skeleton
+
+def _classify_docs(documents: list[dict]) -> dict:
+    """Group a shipment's documents by classification and compute docs_missing.
+
+    Falls back to filename heuristic when `classification` is UNKNOWN.
+    """
+    rc, bol, pod = [], [], []
+    for d in documents or []:
+        cls = (d.get("classification") or "").upper()
+        if cls == "UNKNOWN":
+            cls = _classify(d.get("file_name") or "")
+        if cls == "RC":
+            rc.append(d)
+        elif cls == "BOL":
+            bol.append(d)
+        elif cls == "POD":
+            pod.append(d)
+    missing = []
+    if not rc:
+        missing.append("RC")
+    if not bol:
+        missing.append("BOL")
+    if not pod:
+        missing.append("POD")
+    return {"rc": rc, "bol": bol, "pod": pod, "docs_missing": missing}
+
+
+def _findings_skeleton(batch_records: list[dict]) -> dict:
+    """Build the initial findings file from a batch.
+
+    Each shipment gets an empty `extracted` dict (the agent fills it after
+    reading PDFs) and a pre-computed `docs_missing` list. Shipments with no
+    RC/BOL/POD at all (e.g. invoice-only) are fully resolved and the agent
+    skips reading them entirely.
+    """
+    shipments = []
+    for entry in batch_records:
+        grouped = _classify_docs(entry.get("documents") or [])
+        shipments.append({
+            "shipment_key": entry.get("shipment_key"),
+            "shipment_id":  entry.get("shipment_id"),
+            "extracted":    {},
+            "docs_missing": grouped["docs_missing"],
+        })
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "shipments": shipments,
+    }
+
+
+def _write_findings(doc: dict) -> None:
+    FINDINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    FINDINGS_FILE.write_text(
+        json.dumps(doc, default=str, indent=2), encoding="utf-8"
+    )
 
 
 # ---------------------------------------------------------------- helpers
@@ -69,14 +132,25 @@ def _build_services(config: Config):
     return client, ShipmentService(client), DocumentService(client)
 
 
+_CLASSIFY_TOKEN_RE = {
+    "RC":  __import__("re").compile(r"\b(rc|ratecon|rate[\s_-]?con(?:firmation)?|ratecnf)\b", __import__("re").I),
+    "POD": __import__("re").compile(r"\b(pod|proof[\s_-]?of[\s_-]?delivery|delivery[\s_-]?receipt)\b", __import__("re").I),
+    "BOL": __import__("re").compile(r"\b(bol|bill[\s_-]?of[\s_-]?lading)\b", __import__("re").I),
+}
+
+
 def _classify(file_name: str) -> str:
-    n = (file_name or "").lower()
+    """Classify a doc by filename. Word-boundary aware: matches standalone
+    " RC ", " BOL ", " POD " tokens that carriers use, not just hyphenated
+    forms like "rate-con".
+    """
+    n = file_name or ""
     # Order matters: POD's substrings can collide with BOL; check POD first.
-    if any(k in n for k in ("rate-con", "ratecon", "rate confirmation", "rate_con", "ratecnf")):
+    if _CLASSIFY_TOKEN_RE["RC"].search(n):
         return "RC"
-    if any(k in n for k in ("pod", "proof of delivery", "delivery-receipt", "delivery_receipt")):
+    if _CLASSIFY_TOKEN_RE["POD"].search(n):
         return "POD"
-    if any(k in n for k in ("bol", "bill of lading", "bill-of-lading", "bill_of_lading")):
+    if _CLASSIFY_TOKEN_RE["BOL"].search(n):
         return "BOL"
     return "UNKNOWN"
 
@@ -210,10 +284,12 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             out.append(rec)
 
     _write_sidecar(out)
+    _write_findings(_findings_skeleton(out))
 
     print(json.dumps({
         "count": len(out),
-        "batch_sidecar": str(BATCH_SIDECAR.resolve()),
+        "batch_sidecar":  str(BATCH_SIDECAR.resolve()),
+        "findings_file":  str(FINDINGS_FILE.resolve()),
         "shipments": [_slim_for_stdout(r) for r in out],
     }, default=str, indent=2))
     return 0
@@ -244,11 +320,70 @@ def cmd_verify_one(args: argparse.Namespace) -> int:
         return 1
 
     _write_sidecar([rec])
+    _write_findings(_findings_skeleton([rec]))
     print(json.dumps({
         "count": 1,
-        "batch_sidecar": str(BATCH_SIDECAR.resolve()),
+        "batch_sidecar":  str(BATCH_SIDECAR.resolve()),
+        "findings_file":  str(FINDINGS_FILE.resolve()),
         "shipments": [_slim_for_stdout(rec)],
     }, default=str, indent=2))
+    return 0
+
+
+def cmd_append_findings(args: argparse.Namespace) -> int:
+    """Merge a chunk's extracted records into `.ditat_findings.json`.
+
+    Input JSON shape (accepts either form):
+      A) [ {"shipment_key": "...", "extracted": {...}, "docs_missing": [...]}, ... ]
+      B) {"shipments": [ ...same as A... ]}
+
+    Replaces ad-hoc per-chunk Python the agent used to write. Atomic merge:
+    last-write-wins per shipment_key, missing keys preserved.
+    """
+    src = Path(args.input)
+    if not src.is_absolute():
+        src = _state_root() / src
+    if not src.exists():
+        print(json.dumps({"error": f"chunk file not found: {src}"}), file=sys.stderr)
+        return 1
+    try:
+        payload = json.loads(src.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(json.dumps({"error": f"invalid JSON: {e}"}), file=sys.stderr)
+        return 1
+
+    chunk = payload.get("shipments") if isinstance(payload, dict) else payload
+    if not isinstance(chunk, list):
+        print(json.dumps({"error": "chunk must be a list of shipment records"}), file=sys.stderr)
+        return 1
+
+    if not FINDINGS_FILE.exists():
+        print(json.dumps({
+            "error": f"findings file not found: {FINDINGS_FILE} (run `fetch` first)"
+        }), file=sys.stderr)
+        return 1
+
+    findings = json.loads(FINDINGS_FILE.read_text(encoding="utf-8"))
+    by_key = {str(s.get("shipment_key")): s for s in findings.get("shipments", [])}
+
+    merged, skipped = 0, []
+    for rec in chunk:
+        key = str(rec.get("shipment_key") or "")
+        if not key or key not in by_key:
+            skipped.append(key)
+            continue
+        if "extracted" in rec:
+            by_key[key]["extracted"] = rec["extracted"]
+        if "docs_missing" in rec:
+            by_key[key]["docs_missing"] = rec["docs_missing"]
+        merged += 1
+
+    _write_findings(findings)
+    print(json.dumps({
+        "merged": merged,
+        "skipped_keys": skipped,
+        "findings_file": str(FINDINGS_FILE.resolve()),
+    }, indent=2))
     return 0
 
 
@@ -312,7 +447,10 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M")
         out_path = REPORTS_DIR / f"ditat-verify-{stamp}.docx"
 
-    counters = build_batch_docx(batch_records, findings_index, diff_index, out_path)
+    counters = build_batch_docx(
+        batch_records, findings_index, diff_index, out_path,
+        anomalies_only=getattr(args, "anomalies_only", True),
+    )
 
     rows = []
     for entry in batch_records:
@@ -413,12 +551,23 @@ def main() -> int:
 
     fz = sub.add_parser("finalize",
                         help="Diff + mark + render docx from agent findings + batch sidecar")
-    fz.add_argument("--findings-file", required=True)
+    fz.add_argument("--findings-file", default=str(FINDINGS_FILE),
+                    help="Default: .ditat_findings.json in project dir")
     fz.add_argument("--batch-file", default=None)
     fz.add_argument("--output", default=None)
     fz.add_argument("--cleanup", action="store_true",
                     help="Delete sidecar + findings files after success (default: keep)")
+    fz.add_argument("--anomalies-only", action="store_true", default=True,
+                    help="Docx contains only problematic shipments + counts header "
+                         "(no full summary table). Default: on.")
+    fz.add_argument("--full-report", dest="anomalies_only", action="store_false",
+                    help="Include full summary table of every shipment in docx.")
     fz.set_defaults(func=cmd_finalize)
+
+    af = sub.add_parser("append-findings",
+                        help="Merge chunk records into .ditat_findings.json")
+    af.add_argument("input", help="Path to chunk JSON file (list or {shipments:[...]})")
+    af.set_defaults(func=cmd_append_findings)
 
     m = sub.add_parser("mark", help="Mark one shipment processed (verify-one path)")
     m.add_argument("shipment_key")
