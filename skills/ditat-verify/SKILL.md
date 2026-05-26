@@ -233,6 +233,77 @@ SH-0000009585      OK            0         0  ← not in detail section
 - **Concurrent runs.** State.db uses WAL + busy_timeout=5s; two overlapping invocations won't corrupt state.
 - **`.ditat_batch.json`** is the bridge between `fetch` and `finalize`. It carries the full Ditat record for each shipment so `finalize` can run diffs without re-hitting the API. Delete it manually if a fetch was aborted.
 
+## If something is missing or wrong — guide the user
+
+When any of these conditions show up, **do not fail silently** and **do not just dump the error**. Translate it into the next action the user needs to take, and offer to do it for them where appropriate.
+
+### Environment / install
+
+| Condition | What the user sees / helper returns | What the agent should do |
+|---|---|---|
+| `python` resolves to MS Store shim ("Python was not found; run without arguments to install from the Microsoft Store") | Exit code 49 on Windows | Re-run the command with `py` instead of `python`. Tell the user once: "Windows ships a `python` shim; using `py` (Python launcher) instead." |
+| Neither `py`, `python`, nor `python3` works | command not found | Tell the user to install Python 3.10+ from https://python.org. Stop the flow until installed. |
+| `python-docx` / `requests` / `python-dotenv` import error | `ImportError` in stderr | Run `py -m pip install -r "$env:CLAUDE_PLUGIN_ROOT\scripts\requirements.txt"` (or `python3 -m pip ...` on macOS/Linux). The `SessionStart` hook normally handles this; manual run is the fallback. |
+| Plugin path env var not set (`$CLAUDE_PLUGIN_ROOT` / `$env:CLAUDE_PLUGIN_ROOT` empty) | Helper script not found | Plugin not installed or not active in this session. Tell the user to run `/plugin install ditat-verify@ditat-tools` and restart the session. |
+
+### Project directory
+
+| Condition | What to do |
+|---|---|
+| `$CLAUDE_PROJECT_DIR` unset | Ask the user where to keep shipment state (suggest `~/ditat-verify`). `mkdir -p` it, `cd` in, set `$env:CLAUDE_PROJECT_DIR` for the session. Document this so they can persist it (PowerShell profile / shell rc). |
+| `$CLAUDE_PROJECT_DIR` set but folder missing | Create it with `New-Item -ItemType Directory -Force` / `mkdir -p`. No need to ask — recreate and continue. |
+| Working directory is the plugin folder | Refuse. Cd out to a customer-owned folder first; plugin updates would wipe state. |
+
+### Credentials
+
+| Condition | What to do |
+|---|---|
+| `check-env` returns `ok: false` with non-empty `missing` | Tell the user which vars are missing (named in the JSON). Offer to copy `${CLAUDE_PLUGIN_ROOT}/.env.example` to `${CLAUDE_PROJECT_DIR}/.env` if `.env` does not exist yet. Then ask them to fill the values and re-run `ditat env check`. Do NOT proceed to fetch until `ok: true`. |
+| `.env` exists but values are placeholders (`your_account_id`, etc.) | Same as above — flagged as "missing" by `check-env`. |
+| Token endpoint returns HTTP 401 or "invalid_client" on first fetch | Credentials wrong or revoked. Tell the user to confirm `DITAT_ACCOUNT_ID` / `DITAT_CLIENT_ID` / `DITAT_CLIENT_SECRET` with the Ditat admin. Do NOT keep retrying — burns the 12-fetch/hour budget. |
+| `TokenFetchLimitExceeded` | Hit the 3-per-process cap. Wait, fix the underlying cred issue, then re-run. |
+
+### Ditat permissions
+
+| Condition | What to do |
+|---|---|
+| API returns code 900 on `includeDocuments=true` ("user does not have permission to view documents...") | Helper auto-retries without that flag, but the documents list will be empty. Tell the user the Ditat admin must grant the **Documents View** sub-permission on the API user. Continue the run — shipments with no docs will be marked with `RC MISSING` and the docx will show `RC✗ · BOL✗ · POD✗`. |
+| Same for notes (code 900 mentioning "notes") | Same pattern — notes aren't critical; warn once, continue. |
+
+### Data flow
+
+| Condition | What to do |
+|---|---|
+| `fetch` returns `count: 0` | "No unprocessed shipments in this window." Stop. Do NOT call `finalize`. Offer `--include-processed` if the user wants to re-verify, or a wider window (`--last-month`, `--since-days 60`). |
+| `fetch` returns shipments but every shipment has `documents: []` | Likely the permission gap above. Warn the user; still allow `finalize` to run so Ditat-only checks happen. |
+| One shipment in `fetch` JSON has fewer docs than expected (e.g. no RC) | Normal — note in `docs_missing` and proceed. Diff handles `RC MISSING` verdict. |
+| A PDF Read returns truncated/empty text (scanned image, OCR needed) | Do not retry the same Read repeatedly. List the doc type in `docs_missing` for that shipment and move on. The shipment will appear in the docx with that doc marked missing. |
+| `finalize` says `batch sidecar not found` | Either `fetch` was not run, or `.ditat_batch.json` was deleted. Re-run the appropriate `fetch` or `verify-one`. |
+| Helper says `findings file not found` | Agent skipped Step 3. Stop and ask the user — never call `finalize` without findings. |
+| `verify-one <KEY>` returns `detail fetch failed` | Confirm the key with `ditat verify status` or the user's source list. Keys are numeric strings (e.g. `9536`), not the `SH-...` shipment IDs. |
+
+### Rate limiting / network
+
+| Condition | What to do |
+|---|---|
+| Helper logs `429 rate-limited` warnings | It already backs off automatically. If a fetch fails entirely after retries, suggest reducing `--workers` (e.g. `--workers 2`) or waiting 10–15 minutes. |
+| Network timeout / `requests.exceptions.ConnectTimeout` | Confirm the user can reach `https://tmsapi01.ditat.net` (firewall, VPN). Retry once. |
+| Many 429s plus token fetches → `TokenFetchLimitExceeded` | Stop the run. Wait for the sliding-hour window to reset. The token cache survives across runs, so the next attempt should not refetch. |
+
+### Output
+
+| Condition | What to do |
+|---|---|
+| `finalize` succeeds but `problematic: 0` | All shipments OK. Tell the user explicitly: "N shipments verified, 0 problematic." Still point them at the docx (it has the summary table). |
+| Docx path printed but file unreadable in Word | Check the path is absolute and the customer is opening the right copy. The file is a valid `.docx` (zip) — try Google Docs / LibreOffice as a quick cross-check. |
+
+**General rule:** every failure should end with one of:
+1. "Here is what I changed / will run next" (auto-recoverable — file/env var/cwd fixable),
+2. "Please do X then ask me to retry" (needs the user's input — credentials, admin permissions, install Python),
+3. "Stopping here — Y reason" (hard fail, don't burn budget retrying).
+
+Never silently skip a step. Never call `finalize` if Step 3 was not completed.
+
 ## What this skill does NOT do
 
 - Write back to Ditat (read-only by design).
