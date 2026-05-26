@@ -83,13 +83,38 @@ In a Claude Code session inside that project directory:
 ditat env check
 ```
 
-Or directly:
+Or directly. **On Windows use `py`** (not `python` — Windows ships a Microsoft Store shim that silently fails):
 
+```powershell
+py "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" check-env
 ```
-python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" check-env
+
+macOS / Linux:
+```bash
+python3 "$CLAUDE_PLUGIN_ROOT/scripts/ditat_verify.py" check-env
 ```
 
 Expected: `"ok": true`. If `false`, the `missing` list tells you which env var still has a placeholder value.
+
+### Project directory
+
+The skill stores all per-customer state under whichever folder is `$CLAUDE_PROJECT_DIR` (or the current working directory if unset). First-time customers usually need to create this folder. Pick any directory you control, then:
+
+PowerShell:
+```powershell
+New-Item -ItemType Directory -Force "$HOME\ditat-verify" | Out-Null
+Set-Location "$HOME\ditat-verify"
+$env:CLAUDE_PROJECT_DIR = (Get-Location).Path
+```
+
+Bash:
+```bash
+mkdir -p "$HOME/ditat-verify"
+cd "$HOME/ditat-verify"
+export CLAUDE_PROJECT_DIR="$PWD"
+```
+
+Then place `.env` in that directory. `state.db`, `downloads/`, and `reports/` will be created here on first run.
 
 ---
 

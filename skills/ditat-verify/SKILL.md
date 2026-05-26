@@ -45,16 +45,26 @@ The skill collapses the old per-shipment loop into a fixed 4-step pipeline regar
 
 ### Step 1 — Preflight (first run of session only)
 
-PowerShell:
+**1a. Ensure a working project directory exists.** The skill writes `state.db`, `downloads/`, `reports/`, and the token cache into whichever directory is `$CLAUDE_PROJECT_DIR` (falls back to current working directory). On the customer's first run this folder usually does not exist yet. Before any helper call:
+
+- If `$CLAUDE_PROJECT_DIR` is set and the path exists → use it.
+- If it's set but missing → create it (`New-Item -ItemType Directory -Force <path>` / `mkdir -p <path>`), then `cd` into it.
+- If unset → ask the user where they want shipment state stored (suggest `~/ditat-verify` or similar), `mkdir -p` it, `cd` into it, and `$env:CLAUDE_PROJECT_DIR = <abs path>` (PowerShell) or `export CLAUDE_PROJECT_DIR=<abs path>` (Bash) for the session. Do **not** dump state into the plugin directory.
+
+**1b. Pick the right Python launcher.** On Windows, `python` is often a Microsoft Store shim that fails silently. Prefer `py` (the Python launcher installed with the standard Python.org distribution). On macOS/Linux use `python3`. If both `python` and `py` are missing, the customer needs to install Python 3.10+ first.
+
+**1c. Run the env check:**
+
+PowerShell (Windows):
 ```
-python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" check-env
+py "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" check-env
 ```
 Bash:
 ```
-python "$CLAUDE_PLUGIN_ROOT/scripts/ditat_verify.py" check-env
+python3 "$CLAUDE_PLUGIN_ROOT/scripts/ditat_verify.py" check-env
 ```
 
-If `ok: false`, tell the user to copy `${CLAUDE_PLUGIN_ROOT}/.env.example` to `${CLAUDE_PROJECT_DIR}/.env` and fill credentials. Skip on repeat invocations in the same session.
+If `ok: false`, tell the user to copy `${CLAUDE_PLUGIN_ROOT}/.env.example` to `${CLAUDE_PROJECT_DIR}/.env` and fill credentials. Skip preflight on repeat invocations in the same session.
 
 ### Step 2 — Fetch (single helper call)
 
