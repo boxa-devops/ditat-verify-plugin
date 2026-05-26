@@ -233,6 +233,20 @@ SH-0000009585      OK            0         0  ← not in detail section
 - **Concurrent runs.** State.db uses WAL + busy_timeout=5s; two overlapping invocations won't corrupt state.
 - **`.ditat_batch.json`** is the bridge between `fetch` and `finalize`. It carries the full Ditat record for each shipment so `finalize` can run diffs without re-hitting the API. Delete it manually if a fetch was aborted.
 
+## Anti-patterns — do NOT do these
+
+These are mistakes that look helpful but break the pipeline:
+
+- **Do not write a custom Python script to "stub-mark" partial-doc shipments.** The helper handles them natively: put the shipment in `.ditat_findings.json` with whichever doc keys are present and list the missing ones under `docs_missing: ["RC"]` / `["POD"]` etc. `finalize` will assign verdict `RC MISSING` and mark the row. Calling `mark` per shipment via subprocess re-introduces the O(N) loop this refactor eliminated.
+- **Do not write per-shipment `reports/<key>.md` files.** Dropped on purpose. The deliverable is the one batch `.docx` produced by `finalize`. The `report_path` column in `state.db` is populated by `finalize` with the docx path, not a markdown path.
+- **Do not call `mark` from the agent during a batch run.** `finalize` marks every shipment in one transaction. `mark` is only for the `verify-one` retry path (and even there, `finalize` with a 1-shipment batch is preferred).
+- **Do not branch the helper with custom subprocesses.** If a shipment has no docs at all, still include it in `findings.json` with empty `extracted` and `docs_missing: ["RC", "BOL", "POD"]`. Let `finalize` handle the verdict.
+- **Do not skip `finalize` because "some shipments are incomplete".** `finalize` works with whatever is in `findings.json`. Partial extraction is fine; missing docs is fine. Skipping leaves the docx unbuilt and `state.db` un-updated.
+- **Do not write helper output files into the plugin directory** (`$CLAUDE_PLUGIN_ROOT`). All transient + persistent state lives in `$CLAUDE_PROJECT_DIR`.
+- **Do not retry the same failing Read call repeatedly.** If a PDF cannot be Read (OCR-only, encrypted), record it in `docs_missing` and move on.
+
+If you find yourself writing Python to work around a step, stop and re-read the flow. The helper already covers it.
+
 ## If something is missing or wrong — guide the user
 
 When any of these conditions show up, **do not fail silently** and **do not just dump the error**. Translate it into the next action the user needs to take, and offer to do it for them where appropriate.
@@ -245,6 +259,7 @@ When any of these conditions show up, **do not fail silently** and **do not just
 | Neither `py`, `python`, nor `python3` works | command not found | Tell the user to install Python 3.10+ from https://python.org. Stop the flow until installed. |
 | `python-docx` / `requests` / `python-dotenv` import error | `ImportError` in stderr | Run `py -m pip install -r "$env:CLAUDE_PLUGIN_ROOT\scripts\requirements.txt"` (or `python3 -m pip ...` on macOS/Linux). The `SessionStart` hook normally handles this; manual run is the fallback. |
 | Plugin path env var not set (`$CLAUDE_PLUGIN_ROOT` / `$env:CLAUDE_PLUGIN_ROOT` empty) | Helper script not found | Plugin not installed or not active in this session. Tell the user to run `/plugin install ditat-verify@ditat-tools` and restart the session. |
+| `UnicodeEncodeError: 'charmap' codec can't encode...` when running ad-hoc Python on Windows (Cyrillic / non-ASCII paths or output) | Crash mid-script | Set `PYTHONIOENCODING=utf-8` before the call: `$env:PYTHONIOENCODING = "utf-8"; py ...`. The helper script itself emits UTF-8 JSON safely; this only bites if you invoke Python ad-hoc with non-ASCII content in `print()`. Avoid ad-hoc one-liners over the helper's CLI. |
 
 ### Project directory
 
