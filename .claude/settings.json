@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(Set-Location *)",
+      "PowerShell(Get-Command *)",
+      "PowerShell(Get-Item *)",
+      "PowerShell(Test-Path *)",
+      "PowerShell(Get-Location)",
+      "Bash(nslookup *)",
+      "Bash(railway whoami)",
+      "mcp__repomix__grep_repomix_output",
+      "mcp__repomix__read_repomix_output"
+    ]
+  }
+}

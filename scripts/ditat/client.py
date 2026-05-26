@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -41,6 +42,7 @@ class DitatClient:
         self._token_expires_at: Optional[datetime] = None
         self._token_acquired_at: Optional[datetime] = None
         self._token_fetch_count: int = 0
+        self._token_lock = threading.Lock()
         self._session = requests.Session()
         self._session.headers.update({"Accept": "application/json"})
         self._cache_path = self._compute_cache_path()
@@ -142,15 +144,20 @@ class DitatClient:
         self._save_cached_token()
 
     def _ensure_token(self) -> str:
-        """Ensure a valid token exists, refreshing if needed."""
-        if self._token is None:
-            self._fetch_token()
-        elif self._token_expires_at and (
-            self._token_expires_at - datetime.now(timezone.utc) < timedelta(minutes=5)
-        ):
-            log.info("Token nearing expiration — refreshing")
-            self._fetch_token()
-        return self._token  # type: ignore[return-value]
+        """Ensure a valid token exists, refreshing if needed.
+
+        Thread-safe: serialized via `_token_lock` so parallel workers detecting
+        an expired token won't both call `_fetch_token` and burn the 12/hour budget.
+        """
+        with self._token_lock:
+            if self._token is None:
+                self._fetch_token()
+            elif self._token_expires_at and (
+                self._token_expires_at - datetime.now(timezone.utc) < timedelta(minutes=5)
+            ):
+                log.info("Token nearing expiration — refreshing")
+                self._fetch_token()
+            return self._token  # type: ignore[return-value]
 
     def _token_age(self) -> Optional[timedelta]:
         """Age of currently-held token, if any."""
@@ -202,7 +209,9 @@ class DitatClient:
                 age = self._token_age()
                 if age is None or age >= self.MIN_TOKEN_AGE_FOR_401_REAUTH:
                     log.warning("401 with token age=%s — refreshing token and retrying once", age)
-                    self._token = None
+                    with self._token_lock:
+                        if self._token == token:
+                            self._token = None
                     reauth_attempted = True
                     continue
                 else:

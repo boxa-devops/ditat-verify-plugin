@@ -283,12 +283,17 @@ def diff_pod_rc(pod: Optional[dict], rc: Optional[dict], bol: Optional[dict] = N
     _emit(out, pair, "delivery_date",
           _doc_get(pod, "delivery_date"), _doc_get(rc, "delivery_date"),
           _cmp_date(_doc_get(pod, "delivery_date"), _doc_get(rc, "delivery_date")))
-    rc_weight = _doc_get(rc, "weight_lbs", "weight") or (
-        _doc_get(bol, "weight_lbs", "weight") if bol else None)
+    # `or` would short-circuit on a legitimate 0-weight / 0-pieces fall through
+    # to the BOL value, so check None explicitly.
+    rc_weight = _doc_get(rc, "weight_lbs", "weight")
+    if rc_weight is None and bol is not None:
+        rc_weight = _doc_get(bol, "weight_lbs", "weight")
     _emit(out, pair, "weight_received",
           _doc_get(pod, "weight_received_lbs", "weight_received"), rc_weight,
           _cmp_weight(_doc_get(pod, "weight_received_lbs", "weight_received"), rc_weight))
-    rc_pieces = _doc_get(rc, "pieces") or (_doc_get(bol, "pieces") if bol else None)
+    rc_pieces = _doc_get(rc, "pieces")
+    if rc_pieces is None and bol is not None:
+        rc_pieces = _doc_get(bol, "pieces")
     _emit(out, pair, "pieces_received",
           _doc_get(pod, "pieces_received"), rc_pieces,
           _cmp_int(_doc_get(pod, "pieces_received"), rc_pieces))

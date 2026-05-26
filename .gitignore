@@ -17,3 +17,6 @@ reports/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Claude Code per-user local settings (allowlist, env)
+.claude/settings.local.json
