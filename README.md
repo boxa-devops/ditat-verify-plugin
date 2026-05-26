@@ -145,6 +145,88 @@ If the Ditat API is slow or large PDFs need to be downloaded, allow more time. T
 
 ---
 
+## Scheduling (run it automatically every week)
+
+For ops staff who want the docx waiting in their inbox every Monday morning without ever touching Claude Code manually. Uses **Windows Task Scheduler** — runs locally on the customer's machine, no cloud credentials, no extra services.
+
+### Setup (one-time)
+
+1. Make sure the prerequisites in §Installation are done — plugin installed, `.env` filled, `ditat env check` returns `ok: true`.
+2. Open PowerShell. Navigate to the plugin's scheduling folder:
+   ```powershell
+   cd "$env:CLAUDE_PLUGIN_ROOT\scripts\scheduling"
+   ```
+3. Optionally edit `run-ditat-weekly.ps1` to change the project directory or the prompt (e.g. `verify last month` instead of `verify last week`).
+4. Optionally edit `register-weekly-task.ps1` to change the day/time (default: Monday 09:00).
+5. Run the registrar:
+   ```powershell
+   .\register-weekly-task.ps1
+   ```
+   Output should say `Task registered: DitatVerify-Weekly`.
+
+That's it. Every Monday at 9:00 the task will:
+
+1. Set `$CLAUDE_PROJECT_DIR` to the chosen folder.
+2. Launch Claude Code headless (`claude --print --dangerously-skip-permissions "verify last week"`).
+3. Run the skill end-to-end. The new `.docx` appears in `reports/`.
+4. Append a one-line summary to `<project>\.scheduled-runs.log`.
+
+### Verify it works
+
+Trigger a manual test run:
+
+```powershell
+Start-ScheduledTask -TaskName "DitatVerify-Weekly"
+```
+
+Then check the log:
+
+```powershell
+Get-Content "$HOME\ditat-verify\.scheduled-runs.log" -Tail 10
+```
+
+Expected lines like:
+
+```
+2026-05-26 09:00:14  START prompt='verify last week' project=C:\Users\you\ditat-verify
+2026-05-26 09:01:47  OK docx=C:\Users\you\ditat-verify\reports\ditat-verify-2026-05-26-0901.docx
+```
+
+### Change schedule or remove
+
+To change day/time: edit `register-weekly-task.ps1` then re-run it. The script is idempotent (removes the old task first).
+
+To remove entirely:
+
+```powershell
+.\unregister-weekly-task.ps1
+```
+
+### Limitations
+
+- The task fires only **while the user is logged on** (so Claude Code can launch normally). It will not fire if the laptop is shut down or the user is signed out. To run when logged off, the task would need to store the user's password — not recommended.
+- If the laptop is asleep at 9:00, the task fires when it wakes up (`StartWhenAvailable=true`).
+- The customer must approve the very first `--dangerously-skip-permissions` flag once per session. Inside a scheduled headless run this is automatic.
+
+### Optional: email the docx after each run
+
+Add this block to the bottom of `run-ditat-weekly.ps1` if you want the docx emailed to ops automatically (uses Windows' built-in `Send-MailMessage` — SMTP creds required):
+
+```powershell
+if ($docx -and (Test-Path $docx)) {
+    Send-MailMessage `
+        -From "ops@yourcompany.com" `
+        -To   "ops-team@yourcompany.com" `
+        -Subject "Ditat weekly verification ($(Get-Date -Format 'yyyy-MM-dd'))" `
+        -Body  "Attached: $docx" `
+        -Attachments $docx `
+        -SmtpServer "smtp.yourcompany.com" `
+        -UseSsl
+}
+```
+
+---
+
 ## How the verdicts work
 
 Cross-checks are performed in Python with fixed tolerances — same answer every time.
