@@ -39,6 +39,9 @@ _RC_OK = {
     "delivery_location": {"city": "Atlanta", "state": "GA"},
     "commodity": "Frozen Goods", "weight_lbs": 40000, "pieces": 20,
     "bol_number": "BOL-1",
+    # Accessorial policy terms at-or-better than company defaults.
+    "detention_rate": 50.0, "detention_free_hrs": 2, "detention_max_hrs": 5,
+    "layover_rate": 250.0, "layover_threshold_hrs": 5,
 }
 
 _BOL_OK = {
@@ -68,17 +71,36 @@ class TestVerdicts(unittest.TestCase):
         r = diff.run_diff(_DITAT_OK, _shipment(bol=_BOL_OK, pod=_POD_OK))
         self.assertEqual(r["verdict"], "RC MISSING")
 
-    def test_weight_10pct_off_is_critical(self):
-        bol = dict(_BOL_OK, weight_lbs=44000)  # +10%
+    def test_bol_weight_10pct_over_rc_is_critical(self):
+        bol = dict(_BOL_OK, weight_lbs=44000)  # bol > rc by 10%
         r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
         self.assertEqual(r["verdict"], "ISSUES")
-        self.assertTrue(any(f["field"] == "weight_lbs" for f in r["critical"]))
+        self.assertTrue(any(f["field"] == "weight_lbs" and f["pair"] == "BOL↔RC"
+                            for f in r["critical"]))
 
-    def test_weight_2pct_off_is_warn(self):
-        bol = dict(_BOL_OK, weight_lbs=40800)  # +2%
+    def test_bol_weight_2pct_over_rc_is_ok(self):
+        bol = dict(_BOL_OK, weight_lbs=40800)  # bol > rc by 2% — below 10% threshold
         r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
-        self.assertEqual(r["verdict"], "WARN")
-        self.assertTrue(any(f["field"] == "weight_lbs" for f in r["warn"]))
+        self.assertEqual(r["verdict"], "OK")
+
+    def test_bol_weight_under_rc_is_ok(self):
+        bol = dict(_BOL_OK, weight_lbs=12000)  # bol << rc — under is always ok
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
+        self.assertEqual(r["verdict"], "OK")
+        self.assertFalse(any(f["field"] == "weight_lbs" and f["pair"] == "BOL↔RC"
+                             for f in r["critical"] + r["warn"]))
+
+    def test_bol_pieces_under_rc_is_ok(self):
+        bol = dict(_BOL_OK, pieces=10)  # rc=20, bol<rc
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
+        self.assertFalse(any(f["field"] == "pieces" and f["pair"] == "BOL↔RC"
+                             for f in r["critical"] + r["warn"]))
+
+    def test_bol_pieces_over_rc_by_50pct_is_critical(self):
+        bol = dict(_BOL_OK, pieces=30)  # rc=20, +50%
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
+        self.assertTrue(any(f["field"] == "pieces" and f["pair"] == "BOL↔RC"
+                            for f in r["critical"]))
 
     def test_delivery_3d_late_is_critical(self):
         pod = dict(_POD_OK, delivery_date="2026-05-06")  # +3d
@@ -106,18 +128,67 @@ class TestVerdicts(unittest.TestCase):
         self.assertTrue(any(f["field"] == "bol_number" and f["pair"] == "BOL↔POD"
                             for f in r["critical"]))
 
-    def test_zero_pieces_does_not_fall_through(self):
-        """Regression: `or` short-circuit on 0 used to leak BOL pieces into RC fallback."""
-        rc = dict(_RC_OK, pieces=0)
-        pod = dict(_POD_OK, pieces_received=0)
-        bol = dict(_BOL_OK, pieces=99)  # would have triggered fallback under `or`
+
+    def test_amazon_rc_missing_is_ok(self):
+        ditat = dict(_DITAT_OK, customer="Amazon Logistics LLC")
+        r = diff.run_diff(ditat, _shipment(bol=_BOL_OK, pod=_POD_OK))
+        self.assertEqual(r["verdict"], "OK")
+
+    def test_non_amazon_rc_missing_is_rc_missing(self):
+        ditat = dict(_DITAT_OK, customer="Walmart Inc")
+        r = diff.run_diff(ditat, _shipment(bol=_BOL_OK, pod=_POD_OK))
+        self.assertEqual(r["verdict"], "RC MISSING")
+
+    def test_pod_rc_bol_number_skipped_when_bol_present(self):
+        pod = dict(_POD_OK, bol_number="DIFFERENT-BOL")
+        rc = dict(_RC_OK, bol_number="BOL-1")
+        bol = dict(_BOL_OK, bol_number="BOL-1")
         r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=bol, pod=pod))
-        # 0 vs 0 in POD↔RC should be a match, NOT compared against BOL's 99.
-        pod_rc = [f for f in r["info"] if f["pair"] == "POD↔RC" and f["field"] == "pieces_received"]
-        # info-level findings are filtered out by _emit unless include_info=True; instead
-        # assert there is no critical pieces_received finding.
-        self.assertFalse(any(f["field"] == "pieces_received" and f["pair"] == "POD↔RC"
-                             for f in r["critical"]))
+        # POD↔RC bol_number must NOT fire — BOL↔POD already catches the discrepancy.
+        self.assertFalse(any(f["pair"] == "POD↔RC" and f["field"] == "bol_number"
+                             for f in r["critical"] + r["warn"]))
+        # BOL↔POD must still catch it.
+        self.assertTrue(any(f["pair"] == "BOL↔POD" and f["field"] == "bol_number"
+                            for f in r["critical"]))
+
+    def test_pod_rc_weight_and_pieces_dropped(self):
+        pod = dict(_POD_OK, weight_received_lbs=10, pieces_received=1)
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=_BOL_OK, pod=pod))
+        self.assertFalse(any(f["pair"] == "POD↔RC" and f["field"] in
+                             ("weight_received", "pieces_received")
+                             for f in r["critical"] + r["warn"] + r["info"]))
+
+    def test_rc_policy_default_terms_pass(self):
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=_BOL_OK, pod=_POD_OK))
+        self.assertFalse(any(f["pair"] == "RC-policy"
+                             for f in r["critical"] + r["warn"]))
+
+    def test_rc_detention_rate_below_default_is_critical(self):
+        rc = dict(_RC_OK, detention_rate=35.0)  # 26/05 chat example
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=_POD_OK))
+        self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "detention_rate"
+                            for f in r["critical"]))
+
+    def test_rc_detention_free_hrs_over_default_is_critical(self):
+        rc = dict(_RC_OK, detention_free_hrs=4)
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=_POD_OK))
+        self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "detention_free_hrs"
+                            for f in r["critical"]))
+
+    def test_rc_missing_policy_terms_are_warn(self):
+        rc = {k: v for k, v in _RC_OK.items() if not k.startswith(("detention_", "layover_"))}
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=_POD_OK))
+        warn_fields = {f["field"] for f in r["warn"] if f["pair"] == "RC-policy"}
+        self.assertEqual(warn_fields, {
+            "detention_rate", "detention_free_hrs", "detention_max_hrs",
+            "layover_rate", "layover_threshold_hrs",
+        })
+
+    def test_rc_layover_threshold_over_default_is_warn(self):
+        rc = dict(_RC_OK, layover_threshold_hrs=8)
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=_POD_OK))
+        self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "layover_threshold_hrs"
+                            for f in r["warn"]))
 
     def test_damages_emits_warning(self):
         pod = dict(_POD_OK, damages_notes="1 pallet damaged")

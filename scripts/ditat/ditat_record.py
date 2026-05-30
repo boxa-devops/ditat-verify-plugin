@@ -17,7 +17,7 @@ from .api import ci_get
 _SLIM_KEYS = (
     "bol_number", "load_number", "equipment_type",
     "total_weight_lbs", "total_pieces", "total_revenue", "commodity",
-    "pickup", "delivery",
+    "customer", "pickup", "delivery",
 )
 
 
@@ -93,15 +93,25 @@ def slim_ditat(details: dict) -> dict:
         amt = _safe_float(ci_get(r, "amount", "total", "totalAmount"))
         if amt is not None:
             total_revenue = (total_revenue or 0.0) + amt
+    # Fall back to a top-level revenue column when the rnpShipmentRevenues
+    # collection is absent (some Ditat tenants only populate the scalar field).
+    if total_revenue is None:
+        total_revenue = _safe_float(ci_get(eg, "revenue", "totalRevenue"))
+
+    customer = ci_get(eg, "customer", "customerName", "billToCustomer",
+                      "billTo", "customerLegalName")
+    if isinstance(customer, dict):
+        customer = ci_get(customer, "name", "legalName", "displayName")
 
     return {
         "bol_number":       ci_get(eg, "bolNumber", "bol"),
-        "load_number":      ci_get(eg, "loadNumber", "loadId"),
-        "equipment_type":   ci_get(eg, "equipmentType", "trailerType"),
+        "load_number":      ci_get(eg, "loadId", "loadNumber"),
+        "equipment_type":   ci_get(eg, "equipment", "equipmentType", "trailerType"),
         "total_weight_lbs": total_weight,
         "total_pieces":     total_pieces,
         "total_revenue":    total_revenue,
         "commodity":        commodities[0] if commodities else None,
+        "customer":         customer,
         "pickup":           _stop_summary(stops, "pickup", "origin"),
         "delivery":         _stop_summary(stops, "delivery", "destination", "consignee"),
     }

@@ -166,6 +166,19 @@ The helper merges atomically (last-write-wins per shipment_key). The skeleton's 
 | delivery_location {city, state} | pieces                         |                      |
 | commodity                       | commodity, po_numbers, hazmat  |                      |
 | weight_lbs, pieces              |                                |                      |
+| detention_rate ($/hr)           |                                |                      |
+| detention_free_hrs              |                                |                      |
+| detention_max_hrs               |                                |                      |
+| layover_rate ($/24h)            |                                |                      |
+| layover_threshold_hrs           |                                |                      |
+
+**RC accessorial extraction notes:**
+- `detention_rate` — dollars per hour the carrier is paid for detention.
+- `detention_free_hrs` — free hours before detention starts (typical RC phrasing: "after N free hours").
+- `detention_max_hrs` — cap on detention hours (some RCs cap; omit if RC says no cap).
+- `layover_rate` — dollars per 24-hour layover period.
+- `layover_threshold_hrs` — hours of waiting before layover triggers (typical phrasing: "after X hours").
+- If RC is silent on a term, omit the key — the diff layer will flag it as `WARN` ("RC silent on policy term").
 
 Rules:
 - **Do NOT diff in your head.** `finalize` runs the deterministic diff in Python. Just extract cleanly.
@@ -182,10 +195,39 @@ py "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" finalize
 Defaults: reads `.ditat_findings.json` and `.ditat_batch.json` from project dir; renders **anomalies-only** docx (counts header + problem shipments only).
 
 The helper in one transaction:
-1. Runs cross-checks (BOL↔RC, POD↔RC, Ditat↔RC, BOL↔POD) with tolerances (weight Δ>5% critical, dates Δ>1d critical, money Δ>$1 critical, normalized string compare).
+1. Runs cross-checks with the rules below.
 2. Marks every shipment processed in `state.db`.
 3. Builds **one `.docx`** with counts header + detail section for problematic shipments only.
 4. Optionally deletes the sidecar + findings.
+
+**Cross-check rules:**
+
+| Pair          | Field                          | Rule                                                                   |
+|---------------|--------------------------------|------------------------------------------------------------------------|
+| RC-policy     | detention_rate                 | RC < $50/hr → critical; missing → warn                                 |
+| RC-policy     | detention_free_hrs             | RC > 2 hrs → critical; missing → warn                                  |
+| RC-policy     | detention_max_hrs              | RC < 5 hrs → warn; missing → warn                                      |
+| RC-policy     | layover_rate                   | RC < $250/24h → critical; missing → warn                               |
+| RC-policy     | layover_threshold_hrs          | RC > 5 hrs → warn; missing → warn                                      |
+| BOL↔RC        | weight_lbs                     | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |
+| BOL↔RC        | pieces                         | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |
+| BOL↔RC        | bol_number                     | id mismatch → critical                                                 |
+| BOL↔RC        | dates                          | Δ > 1d → critical; Δ = 1d → warn                                       |
+| BOL↔RC        | commodity / locations          | normalized string compare; mismatch → warn (fuzzy → info)              |
+| POD↔RC        | delivery_date                  | Δ > 1d → critical; Δ = 1d → warn                                       |
+| POD↔RC        | bol_number                     | **skipped when BOL doc present** — BOL↔RC and BOL↔POD cover it         |
+| POD↔RC        | weight_received, pieces_received | **dropped** — POD quantities diverge on partial deliveries           |
+| POD↔RC        | damages_notes                  | any damages → warn                                                     |
+| Ditat↔RC      | total_weight_lbs               | weight Δ > 5% → critical; ≥1% → warn                                   |
+| Ditat↔RC      | total_pieces                   | any diff → critical                                                    |
+| Ditat↔RC      | bol_number, load_number        | id mismatch → critical (Ditat sources: `loadId` / `loadNumber`)        |
+| Ditat↔RC      | equipment_type                 | normalized string compare (Ditat source: `equipment` / `equipmentType`) |
+| Ditat↔RC      | pickup_location, delivery_location | city + state only via normalized compare; full address not required |
+| Ditat↔RC      | revenue_vs_rate                | money Δ > $1 → critical (Ditat sources: revenue sum / `revenue` scalar) |
+| BOL↔POD       | bol_number                     | id mismatch → critical (weight + pieces dropped — POD unreliable)      |
+
+**Special-case verdict:**
+- RC missing **and** customer name contains `amazon` → verdict downgraded from `RC MISSING` to `OK`. Amazon shipments routinely arrive without an RC PDF.
 
 Output JSON:
 ```json
