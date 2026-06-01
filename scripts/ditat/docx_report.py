@@ -81,64 +81,82 @@ def _add_summary_table(doc: Document, rows: list[dict]) -> None:
         cells[5].text = r.get("docs_label", "")
 
 
-def _add_shipment_detail(doc: Document, row: dict, diff_result: dict,
-                          ditat: dict, extracted: dict) -> None:
-    title = f"{row.get('shipment_id') or row.get('shipment_key')} — {diff_result['verdict']}"
-    doc.add_heading(title, level=2)
+# Per-finding severity colors (distinct from the verdict colors above).
+FINDING_SEV_COLOR = {
+    "critical":   RGBColor(0xB0, 0x00, 0x20),  # red
+    "warn":       RGBColor(0xA0, 0x52, 0x00),  # amber
+    "info":       RGBColor(0x70, 0x70, 0x70),  # gray
+    "RC MISSING": RGBColor(0xA0, 0x52, 0x00),  # amber
+}
 
-    # Quick header line: route + dates
-    pickup = ditat.get("pickup") or {}
-    delivery = ditat.get("delivery") or {}
-    route = " → ".join(
-        filter(None, [
-            ", ".join(filter(None, [pickup.get("city"), pickup.get("state")])) or None,
-            ", ".join(filter(None, [delivery.get("city"), delivery.get("state")])) or None,
-        ])
-    )
-    pickup_date = (pickup.get("appointment_from") or pickup.get("appointment_to")
-                   or pickup.get("date") or "")
-    delivery_date = (delivery.get("appointment_from") or delivery.get("appointment_to")
-                     or delivery.get("date") or "")
-    if route:
-        p = doc.add_paragraph()
-        p.add_run("Route: ").bold = True
-        p.add_run(route)
-    if pickup_date or delivery_date:
-        p = doc.add_paragraph()
-        p.add_run("Pickup: ").bold = True
-        p.add_run(str(pickup_date or "—"))
-        p.add_run("    ")
-        p.add_run("Delivery: ").bold = True
-        p.add_run(str(delivery_date or "—"))
-
-    # Critical findings
-    crit = diff_result.get("critical") or []
-    warn = diff_result.get("warn") or []
-    if crit:
-        doc.add_heading("Critical", level=3)
-        for f in crit:
-            _add_finding_bullet(doc, f)
-    if warn:
-        doc.add_heading("Warnings", level=3)
-        for f in warn:
-            _add_finding_bullet(doc, f)
-    if not crit and not warn:
-        # RC missing path — no diffs to show
-        p = doc.add_paragraph()
-        p.add_run("RC missing — could not cross-check against rate confirmation.").italic = True
-
-    # Missing-doc breadcrumb
-    missing = extracted.get("docs_missing") if isinstance(extracted, dict) else None
-    if missing:
-        p = doc.add_paragraph()
-        p.add_run("Missing docs: ").bold = True
-        p.add_run(", ".join(missing))
+_FINDINGS_COLS = ["Shipment", "Severity", "Pair", "Field", "Value", "vs RC", "Note"]
 
 
-def _add_finding_bullet(doc: Document, f: dict) -> None:
-    par = doc.add_paragraph(style="List Bullet")
-    par.add_run(f"[{f['pair']}] ").bold = True
-    par.add_run(f"{f['field']}: {f['a']} vs {f['b']} ({f['message']})")
+def _add_findings_table(doc: Document, rows: list[dict]) -> None:
+    """One consolidated table — every finding across the batch is a row."""
+    table = doc.add_table(rows=1, cols=len(_FINDINGS_COLS))
+    table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    table.style = "Light Grid Accent 1"
+    hdr = table.rows[0].cells
+    for i, label in enumerate(_FINDINGS_COLS):
+        hdr[i].text = label
+        for p in hdr[i].paragraphs:
+            for r in p.runs:
+                r.bold = True
+
+    for r in rows:
+        cells = table.add_row().cells
+        cells[0].text = str(r["shipment"])
+        sev_cell = cells[1]
+        sev_cell.text = r["severity"]
+        color = FINDING_SEV_COLOR.get(r["severity"])
+        if color is not None:
+            for p in sev_cell.paragraphs:
+                for run in p.runs:
+                    run.font.color.rgb = color
+                    run.bold = True
+        cells[2].text = str(r["pair"])
+        cells[3].text = str(r["field"])
+        cells[4].text = str(r["value"])
+        cells[5].text = str(r["vs"])
+        cells[6].text = str(r["note"])
+
+
+_SEV_RANK = {"critical": 0, "warn": 1, "info": 2, "RC MISSING": 3}
+
+
+def _findings_rows(problematic_keys, batch, diff_index, findings_index) -> list[dict]:
+    """Flatten every problematic shipment's findings into table rows."""
+    by_key = {e.get("shipment_key"): e for e in batch}
+    rows: list[dict] = []
+    for key in problematic_keys:
+        entry = by_key.get(key, {})
+        ship = entry.get("shipment_id") or key
+        diff_result = diff_index.get(key) or {}
+        verdict = diff_result.get("verdict", "RC MISSING")
+        crit = diff_result.get("critical") or []
+        warn = diff_result.get("warn") or []
+        if crit or warn:
+            for f in [*crit, *warn]:
+                rows.append({
+                    "shipment": ship, "severity": f["severity"],
+                    "pair": f["pair"], "field": f["field"],
+                    "value": f["a"], "vs": f["b"], "note": f["message"],
+                })
+        else:
+            rows.append({
+                "shipment": ship, "severity": verdict, "pair": "—", "field": "—",
+                "value": "", "vs": "", "note": "RC missing — no cross-check",
+            })
+        missing = (findings_index.get(key) or {}).get("docs_missing") or []
+        if missing:
+            rows.append({
+                "shipment": ship, "severity": "info", "pair": "docs",
+                "field": "missing", "value": "", "vs": ", ".join(missing),
+                "note": "not provided",
+            })
+    rows.sort(key=lambda r: (str(r["shipment"]), _SEV_RANK.get(r["severity"], 9)))
+    return rows
 
 
 def build_batch_docx(
@@ -196,18 +214,9 @@ def build_batch_docx(
     if problematic_keys:
         if not anomalies_only:
             doc.add_page_break()
-        doc.add_heading("Problematic shipments", level=1)
-        # Build key→entry map once
-        by_key = {e.get("shipment_key"): e for e in batch}
-        for i, key in enumerate(problematic_keys):
-            entry = by_key.get(key, {})
-            row = next((r for r in summary_rows if r["shipment_key"] == key), {})
-            extracted = findings_index.get(key) or {}
-            diff_result = diff_index.get(key) or {}
-            ditat = entry.get("ditat_fields") or {}
-            if i > 0:
-                doc.add_paragraph("")
-            _add_shipment_detail(doc, row, diff_result, ditat, extracted)
+        doc.add_heading("Findings", level=1)
+        rows = _findings_rows(problematic_keys, batch, diff_index, findings_index)
+        _add_findings_table(doc, rows)
     else:
         doc.add_paragraph("")
         p = doc.add_paragraph()
