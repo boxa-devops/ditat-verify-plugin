@@ -133,7 +133,7 @@ def _add_findings_table(doc: Document, groups: list[dict]) -> None:
                 r.bold = True
 
     for g in groups:
-        _add_banner_row(table, f"{g['ship']}  —  {g['verdict']}")
+        _add_banner_row(table, g["banner"])
         for r in g["rows"]:
             cells = table.add_row().cells
             sev_cell = cells[0]
@@ -154,8 +154,35 @@ def _add_findings_table(doc: Document, groups: list[dict]) -> None:
 _SEV_RANK = {"critical": 0, "warn": 1, "info": 2, "RC MISSING": 3}
 
 
+def _city_state(loc: dict) -> str:
+    return ", ".join(filter(None, [loc.get("city"), loc.get("state")]))
+
+
+def _short_date(v) -> str:
+    """First 10 chars of an ISO timestamp → YYYY-MM-DD; pass through otherwise."""
+    s = str(v or "")
+    return s[:10] if len(s) >= 10 and s[4] == "-" else s
+
+
+def _banner_text(ship, verdict: str, ncrit: int, nwarn: int, ditat: dict) -> str:
+    """shipment — VERDICT · N crit / M warn · route · dates."""
+    parts = [f"{ship}  —  {verdict}", f"{ncrit} crit / {nwarn} warn"]
+    pickup = ditat.get("pickup") or {}
+    delivery = ditat.get("delivery") or {}
+    route = " → ".join(filter(None, [_city_state(pickup), _city_state(delivery)]))
+    if route:
+        parts.append(route)
+    pdate = _short_date(pickup.get("appointment_from") or pickup.get("appointment_to")
+                        or pickup.get("date"))
+    ddate = _short_date(delivery.get("appointment_from") or delivery.get("appointment_to")
+                        or delivery.get("date"))
+    if pdate or ddate:
+        parts.append(f"{pdate or '—'} → {ddate or '—'}")
+    return "    ·    ".join(parts)
+
+
 def _findings_groups(problematic_keys, batch, diff_index, findings_index) -> list[dict]:
-    """Group findings per shipment: [{ship, verdict, rows:[...]}], sorted by ship."""
+    """Group findings per shipment: [{ship, verdict, banner, rows:[...]}], by ship."""
     by_key = {e.get("shipment_key"): e for e in batch}
     groups: list[dict] = []
     for key in problematic_keys:
@@ -163,8 +190,10 @@ def _findings_groups(problematic_keys, batch, diff_index, findings_index) -> lis
         ship = entry.get("shipment_id") or key
         diff_result = diff_index.get(key) or {}
         verdict = diff_result.get("verdict", "RC MISSING")
+        crit = diff_result.get("critical") or []
+        warn = diff_result.get("warn") or []
         rows: list[dict] = []
-        for f in [*(diff_result.get("critical") or []), *(diff_result.get("warn") or [])]:
+        for f in [*crit, *warn]:
             rows.append({
                 "severity": f["severity"], "pair": f["pair"], "field": f["field"],
                 "value": f["a"], "vs": f["b"], "note": f["message"],
@@ -181,7 +210,9 @@ def _findings_groups(problematic_keys, batch, diff_index, findings_index) -> lis
                 "value": "", "vs": ", ".join(missing), "note": "not provided",
             })
         rows.sort(key=lambda r: _SEV_RANK.get(r["severity"], 9))
-        groups.append({"ship": ship, "verdict": verdict, "rows": rows})
+        banner = _banner_text(ship, verdict, len(crit), len(warn),
+                              entry.get("ditat_fields") or {})
+        groups.append({"ship": ship, "verdict": verdict, "banner": banner, "rows": rows})
     groups.sort(key=lambda g: str(g["ship"]))
     return groups
 
