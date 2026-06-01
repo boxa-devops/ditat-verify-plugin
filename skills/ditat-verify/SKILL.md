@@ -132,10 +132,11 @@ PDF extraction is done by Claude via the Read tool — Python's role is I/O + di
 
 **After each chunk, append the chunk's records via the helper — never write ad-hoc Python.**
 
-Write the chunk records to a temp JSON file then call:
+Write the chunk records to a file named `.ditat_chunk_<n>.json` in the project dir, then call:
 ```
-py "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" append-findings <chunk-file.json>
+py "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" append-findings .ditat_chunk_1.json
 ```
+(Use the `.ditat_chunk_*.json` name so `finalize` auto-cleans it afterward.)
 
 Chunk file schema (list form):
 ```json
@@ -214,7 +215,7 @@ The helper:
 1. Loads thresholds from `rules.yaml` (falls back to built-in defaults if absent).
 2. Runs cross-checks with the rules below.
 3. Builds **one `.docx`** with counts header + detail section for problematic shipments only.
-4. Optionally deletes the sidecar + findings.
+4. Cleans every per-run intermediate (downloads/, sidecar, findings, chunk files), leaving only `reports/`. Pass `--keep-intermediates` to retain them.
 
 **Cross-check rules** (defaults — all tunable in `rules.yaml`):
 
@@ -259,7 +260,7 @@ Flags:
 - `--findings-file <path>` — override findings path (default: `.ditat_findings.json`)
 - `--batch-file <path>` — override sidecar path
 - `--rules-file <path>` — override rules.yaml path
-- `--cleanup` — delete sidecar + findings after success
+- `--keep-intermediates` — keep downloads/, sidecar, findings, chunk files (default: deleted, leaving only reports/)
 - `--full-report` — include all-shipments summary table in docx (default omits it)
 
 ### Step 5 — Roll up to user

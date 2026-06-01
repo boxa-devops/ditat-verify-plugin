@@ -23,6 +23,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,6 +78,36 @@ def _findings_skeleton(batch_records: list[dict]) -> dict:
 def _write_findings(doc: dict) -> None:
     FINDINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     FINDINGS_FILE.write_text(json.dumps(doc, default=str, indent=2), encoding="utf-8")
+
+
+def _cleanup_intermediates(batch_path: Path, findings_path: Path) -> list[str]:
+    """Delete every per-run intermediate, leaving only the reports/ folder.
+
+    Removes the batch sidecar, findings file, the downloads/ tree, and any agent
+    chunk files. The .env (config) and reports/ (deliverables) are never touched.
+    """
+    removed: list[str] = []
+    for p in (batch_path, findings_path):
+        try:
+            if p.exists():
+                p.unlink()
+                removed.append(str(p))
+        except OSError:
+            pass
+    if DOWNLOAD_DIR.exists():
+        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+        removed.append(str(DOWNLOAD_DIR))
+    root = _state_root()
+    for pattern in (".ditat_chunk_*.json", "chunk*.json"):
+        for cp in root.glob(pattern):
+            try:
+                cp.unlink()
+                removed.append(str(cp))
+            except OSError:
+                pass
+    if removed:
+        log.info("Cleaned %d intermediate(s): %s", len(removed), ", ".join(removed))
+    return removed
 
 
 def _write_sidecar(records: list[dict]) -> None:
@@ -306,6 +337,8 @@ def cmd_finalize(args: argparse.Namespace) -> int:
                 "warn":         d.get("warn_count", 0),
             })
 
+    cleaned = [] if args.keep_intermediates else _cleanup_intermediates(batch_path, findings_path)
+
     print(json.dumps({
         "docx": str(out_path.resolve()),
         "processed": counters["shipments"],
@@ -313,14 +346,8 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         "problematic": counters["problematic"],
         "verdicts": counters["verdicts"],
         "problem_shipments": problem_rows,
+        "cleaned": len(cleaned),
     }, indent=2))
-
-    if args.cleanup:
-        for p in (batch_path, findings_path):
-            try:
-                p.unlink()
-            except OSError:
-                pass
 
     return 0
 
@@ -353,8 +380,9 @@ def main() -> int:
     fz.add_argument("--rules-file", default=None,
                     help="Path to rules.yaml. Default: auto-discover (scripts/rules.yaml).")
     fz.add_argument("--output", default=None)
-    fz.add_argument("--cleanup", action="store_true",
-                    help="Delete sidecar + findings files after success (default: keep)")
+    fz.add_argument("--keep-intermediates", action="store_true",
+                    help="Keep downloads/, sidecar, findings, and chunk files. "
+                         "Default: delete them after success, leaving only reports/.")
     fz.add_argument("--anomalies-only", action="store_true", default=True,
                     help="Docx contains only problematic shipments + counts header. Default: on.")
     fz.add_argument("--full-report", dest="anomalies_only", action="store_false",
