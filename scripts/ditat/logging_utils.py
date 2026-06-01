@@ -1,11 +1,10 @@
 """Logging utilities."""
 
 import logging
-from typing import Optional
 
 
 def setup_logging(verbose: bool = False) -> logging.Logger:
-    """Configure logging."""
+    """Configure root logging and return the 'ditat' logger."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -13,6 +12,3 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
         datefmt="%H:%M:%S",
     )
     return logging.getLogger("ditat")
-
-
-log: Optional[logging.Logger] = None

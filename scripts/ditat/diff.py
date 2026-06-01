@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime
+from functools import partial
 from typing import Any, Optional
+
+from .rules import default_rules
 
 # Severity tiers
 CRIT = "critical"
@@ -109,7 +112,8 @@ def _fmt(v: Any) -> str:
 
 # ---------------------------------------------------------------- comparators
 
-def _cmp_weight(a: Any, b: Any) -> tuple[str, str] | None:
+def _cmp_weight(a: Any, b: Any, critical_pct: float = 5.0,
+                warn_pct: float = 1.0) -> tuple[str, str] | None:
     """Return (severity, message) or None if both missing."""
     fa, fb = _to_float(a), _to_float(b)
     if fa is None and fb is None:
@@ -118,9 +122,9 @@ def _cmp_weight(a: Any, b: Any) -> tuple[str, str] | None:
         return (WARN, "missing on one side")
     base = max(abs(fa), abs(fb), 1.0)
     delta_pct = abs(fa - fb) / base * 100.0
-    if delta_pct > 5.0:
+    if delta_pct > critical_pct:
         return (CRIT, f"Δ {delta_pct:.1f}%")
-    if delta_pct >= 1.0:
+    if delta_pct >= warn_pct:
         return (WARN, f"Δ {delta_pct:.1f}%")
     if delta_pct > 0.0:
         return (INFO, f"Δ {delta_pct:.1f}%")
@@ -159,7 +163,8 @@ def _cmp_overage_int(a: Any, b: Any, threshold_pct: float = 10.0) -> tuple[str, 
     return (INFO, f"bol>rc Δ {ia - ib:+d}")
 
 
-def _cmp_money(a: Any, b: Any) -> tuple[str, str] | None:
+def _cmp_money(a: Any, b: Any, critical_abs: float = 1.0,
+               critical_pct: float = 1.0) -> tuple[str, str] | None:
     fa, fb = _to_float(a), _to_float(b)
     if fa is None and fb is None:
         return None
@@ -168,21 +173,21 @@ def _cmp_money(a: Any, b: Any) -> tuple[str, str] | None:
     delta = abs(fa - fb)
     base = max(abs(fa), abs(fb), 1.0)
     delta_pct = delta / base * 100.0
-    if delta > 1.0 or delta_pct > 1.0:
+    if delta > critical_abs or delta_pct > critical_pct:
         return (CRIT, f"Δ ${delta:.2f} ({delta_pct:.1f}%)")
     if delta > 0:
         return (INFO, f"Δ ${delta:.2f}")
     return (INFO, "match")
 
 
-def _cmp_date(a: Any, b: Any) -> tuple[str, str] | None:
+def _cmp_date(a: Any, b: Any, critical_days: int = 1) -> tuple[str, str] | None:
     da, db = _to_date(a), _to_date(b)
     if da is None and db is None:
         return None
     if da is None or db is None:
         return (WARN, "missing on one side")
     delta_days = (da - db).days
-    if abs(delta_days) > 1:
+    if abs(delta_days) > critical_days:
         return (CRIT, f"{delta_days:+d}d")
     if delta_days != 0:
         return (WARN, f"{delta_days:+d}d")
@@ -251,7 +256,9 @@ def _city_state(loc: Optional[dict]) -> Optional[str]:
 # ---------------------------------------------------------------- cross-checks
 
 def _emit(findings: list[dict], pair: str, field: str, a: Any, b: Any,
-          result: tuple[str, str] | None, include_info: bool = False) -> None:
+          cmp, include_info: bool = False) -> None:
+    """Run comparator `cmp(a, b)` once and append a finding if it's notable."""
+    result = cmp(a, b)
     if result is None:
         return
     severity, msg = result
@@ -267,56 +274,51 @@ def _emit(findings: list[dict], pair: str, field: str, a: Any, b: Any,
     })
 
 
-def diff_bol_rc(bol: Optional[dict], rc: Optional[dict]) -> list[dict]:
+def diff_bol_rc(bol: Optional[dict], rc: Optional[dict], rules: dict) -> list[dict]:
     out: list[dict] = []
     if not bol or not rc:
         return out
     pair = "BOL↔RC"
+    cmp_date = partial(_cmp_date, critical_days=rules["date"]["critical_days"])
+    cmp_str = partial(_cmp_str, severity_on_diff=rules["string_mismatch_severity"])
+    cmp_w = partial(_cmp_overage_weight,
+                    threshold_pct=rules["bol_rc_overage"]["weight_threshold_pct"])
+    cmp_p = partial(_cmp_overage_int,
+                    threshold_pct=rules["bol_rc_overage"]["pieces_threshold_pct"])
     _emit(out, pair, "bol_number",
-          _doc_get(bol, "bol_number"), _doc_get(rc, "bol_number"),
-          _cmp_id(_doc_get(bol, "bol_number"), _doc_get(rc, "bol_number")))
+          _doc_get(bol, "bol_number"), _doc_get(rc, "bol_number"), _cmp_id)
     _emit(out, pair, "pickup_date",
-          _doc_get(bol, "pickup_date"), _doc_get(rc, "pickup_date"),
-          _cmp_date(_doc_get(bol, "pickup_date"), _doc_get(rc, "pickup_date")))
+          _doc_get(bol, "pickup_date"), _doc_get(rc, "pickup_date"), cmp_date)
     _emit(out, pair, "delivery_date",
-          _doc_get(bol, "delivery_date"), _doc_get(rc, "delivery_date"),
-          _cmp_date(_doc_get(bol, "delivery_date"), _doc_get(rc, "delivery_date")))
+          _doc_get(bol, "delivery_date"), _doc_get(rc, "delivery_date"), cmp_date)
     _emit(out, pair, "weight_lbs",
-          _doc_get(bol, "weight_lbs", "weight"), _doc_get(rc, "weight_lbs", "weight"),
-          _cmp_overage_weight(_doc_get(bol, "weight_lbs", "weight"),
-                              _doc_get(rc, "weight_lbs", "weight")))
+          _doc_get(bol, "weight_lbs", "weight"), _doc_get(rc, "weight_lbs", "weight"), cmp_w)
     _emit(out, pair, "pieces",
-          _doc_get(bol, "pieces"), _doc_get(rc, "pieces"),
-          _cmp_overage_int(_doc_get(bol, "pieces"), _doc_get(rc, "pieces")))
+          _doc_get(bol, "pieces"), _doc_get(rc, "pieces"), cmp_p)
     _emit(out, pair, "commodity",
-          _doc_get(bol, "commodity"), _doc_get(rc, "commodity"),
-          _cmp_str(_doc_get(bol, "commodity"), _doc_get(rc, "commodity")))
+          _doc_get(bol, "commodity"), _doc_get(rc, "commodity"), cmp_str)
     _emit(out, pair, "pickup_location",
           _city_state(_doc_get(bol, "shipper", "pickup")),
-          _city_state(_doc_get(rc, "pickup_location", "pickup")),
-          _cmp_str(_city_state(_doc_get(bol, "shipper", "pickup")),
-                   _city_state(_doc_get(rc, "pickup_location", "pickup"))))
+          _city_state(_doc_get(rc, "pickup_location", "pickup")), cmp_str)
     _emit(out, pair, "delivery_location",
           _city_state(_doc_get(bol, "consignee", "delivery")),
-          _city_state(_doc_get(rc, "delivery_location", "delivery")),
-          _cmp_str(_city_state(_doc_get(bol, "consignee", "delivery")),
-                   _city_state(_doc_get(rc, "delivery_location", "delivery"))))
+          _city_state(_doc_get(rc, "delivery_location", "delivery")), cmp_str)
     return out
 
 
-def diff_pod_rc(pod: Optional[dict], rc: Optional[dict], bol: Optional[dict] = None) -> list[dict]:
+def diff_pod_rc(pod: Optional[dict], rc: Optional[dict], rules: dict,
+                bol: Optional[dict] = None) -> list[dict]:
     out: list[dict] = []
     if not pod or not rc:
         return out
     pair = "POD↔RC"
+    cmp_date = partial(_cmp_date, critical_days=rules["date"]["critical_days"])
     # bol_number: skip when BOL doc present — already covered by BOL↔RC and BOL↔POD.
     if not bol:
         _emit(out, pair, "bol_number",
-              _doc_get(pod, "bol_number"), _doc_get(rc, "bol_number"),
-              _cmp_id(_doc_get(pod, "bol_number"), _doc_get(rc, "bol_number")))
+              _doc_get(pod, "bol_number"), _doc_get(rc, "bol_number"), _cmp_id)
     _emit(out, pair, "delivery_date",
-          _doc_get(pod, "delivery_date"), _doc_get(rc, "delivery_date"),
-          _cmp_date(_doc_get(pod, "delivery_date"), _doc_get(rc, "delivery_date")))
+          _doc_get(pod, "delivery_date"), _doc_get(rc, "delivery_date"), cmp_date)
     # weight_received + pieces_received intentionally dropped — POD quantities
     # routinely diverge from RC (partial deliveries, short-loads) and produced noise.
     damages = _doc_get(pod, "damages_notes", "damages")
@@ -329,59 +331,51 @@ def diff_pod_rc(pod: Optional[dict], rc: Optional[dict], bol: Optional[dict] = N
     return out
 
 
-def diff_ditat_rc(ditat: Optional[dict], rc: Optional[dict]) -> list[dict]:
+def diff_ditat_rc(ditat: Optional[dict], rc: Optional[dict], rules: dict) -> list[dict]:
     out: list[dict] = []
     if not ditat or not rc:
         return out
     pair = "Ditat↔RC"
+    cmp_str = partial(_cmp_str, severity_on_diff=rules["string_mismatch_severity"])
+    cmp_weight = partial(_cmp_weight,
+                         critical_pct=rules["weight_ditat_rc"]["critical_pct"],
+                         warn_pct=rules["weight_ditat_rc"]["warn_pct"])
+    cmp_money = partial(_cmp_money,
+                        critical_abs=rules["money"]["critical_abs"],
+                        critical_pct=rules["money"]["critical_pct"])
     _emit(out, pair, "bol_number",
-          ditat.get("bol_number"), _doc_get(rc, "bol_number"),
-          _cmp_id(ditat.get("bol_number"), _doc_get(rc, "bol_number")))
+          ditat.get("bol_number"), _doc_get(rc, "bol_number"), _cmp_id)
     _emit(out, pair, "load_number",
-          ditat.get("load_number"), _doc_get(rc, "load_number"),
-          _cmp_id(ditat.get("load_number"), _doc_get(rc, "load_number")))
+          ditat.get("load_number"), _doc_get(rc, "load_number"), _cmp_id)
     _emit(out, pair, "total_weight_lbs",
-          ditat.get("total_weight_lbs"), _doc_get(rc, "weight_lbs", "weight"),
-          _cmp_weight(ditat.get("total_weight_lbs"), _doc_get(rc, "weight_lbs", "weight")))
+          ditat.get("total_weight_lbs"), _doc_get(rc, "weight_lbs", "weight"), cmp_weight)
     _emit(out, pair, "total_pieces",
-          ditat.get("total_pieces"), _doc_get(rc, "pieces"),
-          _cmp_int(ditat.get("total_pieces"), _doc_get(rc, "pieces")))
+          ditat.get("total_pieces"), _doc_get(rc, "pieces"), _cmp_int)
     _emit(out, pair, "equipment_type",
-          ditat.get("equipment_type"), _doc_get(rc, "equipment_type"),
-          _cmp_str(ditat.get("equipment_type"), _doc_get(rc, "equipment_type")))
+          ditat.get("equipment_type"), _doc_get(rc, "equipment_type"), cmp_str)
     _emit(out, pair, "pickup_location",
-          _city_state(ditat.get("pickup")), _city_state(_doc_get(rc, "pickup_location", "pickup")),
-          _cmp_str(_city_state(ditat.get("pickup")),
-                   _city_state(_doc_get(rc, "pickup_location", "pickup"))))
+          _city_state(ditat.get("pickup")),
+          _city_state(_doc_get(rc, "pickup_location", "pickup")), cmp_str)
     _emit(out, pair, "delivery_location",
           _city_state(ditat.get("delivery")),
-          _city_state(_doc_get(rc, "delivery_location", "delivery")),
-          _cmp_str(_city_state(ditat.get("delivery")),
-                   _city_state(_doc_get(rc, "delivery_location", "delivery"))))
+          _city_state(_doc_get(rc, "delivery_location", "delivery")), cmp_str)
     _emit(out, pair, "revenue_vs_rate",
-          ditat.get("total_revenue"), _doc_get(rc, "agreed_rate", "rate"),
-          _cmp_money(ditat.get("total_revenue"), _doc_get(rc, "agreed_rate", "rate")))
+          ditat.get("total_revenue"), _doc_get(rc, "agreed_rate", "rate"), cmp_money)
     return out
 
 
-# Company default accessorial policy. RC terms worse than these = we lose money.
-_DEFAULT_DETENTION_RATE = 50.0      # $/hr
-_DEFAULT_DETENTION_FREE_HRS = 2.0   # free time before detention starts
-_DEFAULT_DETENTION_MAX_HRS = 5.0    # cap on detention hours billed
-_DEFAULT_LAYOVER_RATE = 250.0       # $ per 24h
-_DEFAULT_LAYOVER_THRESHOLD_HRS = 5.0  # wait length before layover triggers
-
-
-def diff_rc_policy(rc: Optional[dict]) -> list[dict]:
+def diff_rc_policy(rc: Optional[dict], rules: dict) -> list[dict]:
     """RC-only check: does the rate confirmation honor our accessorial policy?
 
     Missing terms → warn (RC should spell them out). Worse-than-default terms →
-    critical (we'd be undercompensated on detention/layover).
+    critical/warn per the configured severities (we'd be undercompensated).
     """
     out: list[dict] = []
     if not rc:
         return out
     pair = "RC-policy"
+    pol = rules["accessorial"]
+    sev = pol["severities"]
 
     det_rate = _to_float(_doc_get(rc, "detention_rate"))
     det_free = _to_float(_doc_get(rc, "detention_free_hrs", "detention_free_hours"))
@@ -396,37 +390,38 @@ def diff_rc_policy(rc: Optional[dict]) -> list[dict]:
             "severity": WARN, "message": "RC silent on policy term",
         })
 
-    def _worse(field: str, actual: float, default: float, unit: str, severity: str = CRIT) -> None:
+    def _worse(field: str, actual: float, default: float, unit: str) -> None:
         out.append({
             "pair": pair, "field": field,
             "a": f"{actual:g} {unit}", "b": f"{default:g} {unit} (default)",
-            "severity": severity, "message": "RC term worse than company default",
+            "severity": sev[field], "message": "RC term worse than company default",
         })
 
+    # (value, "lower"|"higher" is-worse direction, default, unit, missing-label)
     if det_rate is None:
-        _missing("detention_rate", f"≥ ${_DEFAULT_DETENTION_RATE:g}/hr")
-    elif det_rate < _DEFAULT_DETENTION_RATE:
-        _worse("detention_rate", det_rate, _DEFAULT_DETENTION_RATE, "$/hr")
+        _missing("detention_rate", f"≥ ${pol['detention_rate']:g}/hr")
+    elif det_rate < pol["detention_rate"]:
+        _worse("detention_rate", det_rate, pol["detention_rate"], "$/hr")
 
     if det_free is None:
-        _missing("detention_free_hrs", f"≤ {_DEFAULT_DETENTION_FREE_HRS:g} hrs")
-    elif det_free > _DEFAULT_DETENTION_FREE_HRS:
-        _worse("detention_free_hrs", det_free, _DEFAULT_DETENTION_FREE_HRS, "hrs")
+        _missing("detention_free_hrs", f"≤ {pol['detention_free_hrs']:g} hrs")
+    elif det_free > pol["detention_free_hrs"]:
+        _worse("detention_free_hrs", det_free, pol["detention_free_hrs"], "hrs")
 
     if det_max is None:
-        _missing("detention_max_hrs", f"≥ {_DEFAULT_DETENTION_MAX_HRS:g} hrs")
-    elif det_max < _DEFAULT_DETENTION_MAX_HRS:
-        _worse("detention_max_hrs", det_max, _DEFAULT_DETENTION_MAX_HRS, "hrs", severity=WARN)
+        _missing("detention_max_hrs", f"≥ {pol['detention_max_hrs']:g} hrs")
+    elif det_max < pol["detention_max_hrs"]:
+        _worse("detention_max_hrs", det_max, pol["detention_max_hrs"], "hrs")
 
     if lay_rate is None:
-        _missing("layover_rate", f"≥ ${_DEFAULT_LAYOVER_RATE:g}/24h")
-    elif lay_rate < _DEFAULT_LAYOVER_RATE:
-        _worse("layover_rate", lay_rate, _DEFAULT_LAYOVER_RATE, "$/24h")
+        _missing("layover_rate", f"≥ ${pol['layover_rate']:g}/24h")
+    elif lay_rate < pol["layover_rate"]:
+        _worse("layover_rate", lay_rate, pol["layover_rate"], "$/24h")
 
     if lay_thr is None:
-        _missing("layover_threshold_hrs", f"≤ {_DEFAULT_LAYOVER_THRESHOLD_HRS:g} hrs")
-    elif lay_thr > _DEFAULT_LAYOVER_THRESHOLD_HRS:
-        _worse("layover_threshold_hrs", lay_thr, _DEFAULT_LAYOVER_THRESHOLD_HRS, "hrs", severity=WARN)
+        _missing("layover_threshold_hrs", f"≤ {pol['layover_threshold_hrs']:g} hrs")
+    elif lay_thr > pol["layover_threshold_hrs"]:
+        _worse("layover_threshold_hrs", lay_thr, pol["layover_threshold_hrs"], "hrs")
 
     return out
 
@@ -440,24 +435,29 @@ def diff_bol_pod(bol: Optional[dict], pod: Optional[dict]) -> list[dict]:
     # pieces_received) routinely diverge from the BOL on partial deliveries —
     # surfaced too much noise so they were dropped.
     _emit(out, pair, "bol_number",
-          _doc_get(bol, "bol_number"), _doc_get(pod, "bol_number"),
-          _cmp_id(_doc_get(bol, "bol_number"), _doc_get(pod, "bol_number")))
+          _doc_get(bol, "bol_number"), _doc_get(pod, "bol_number"), _cmp_id)
     return out
 
 
 # ---------------------------------------------------------------- top-level
 
-def run_diff(ditat: dict, extracted: dict) -> dict:
-    """Run all cross-checks. Returns dict with findings + counters + verdict."""
+def run_diff(ditat: dict, extracted: dict, rules: Optional[dict] = None) -> dict:
+    """Run all cross-checks. Returns dict with findings + counters + verdict.
+
+    `rules` defaults to the built-in defaults; pass a dict from rules.load_rules()
+    to override thresholds/policy.
+    """
+    if rules is None:
+        rules = default_rules()
     rc = extracted.get("rc") if isinstance(extracted, dict) else None
     bol = extracted.get("bol") if isinstance(extracted, dict) else None
     pod = extracted.get("pod") if isinstance(extracted, dict) else None
 
     findings: list[dict] = []
-    findings.extend(diff_rc_policy(rc))
-    findings.extend(diff_bol_rc(bol, rc))
-    findings.extend(diff_pod_rc(pod, rc, bol))
-    findings.extend(diff_ditat_rc(ditat, rc))
+    findings.extend(diff_rc_policy(rc, rules))
+    findings.extend(diff_bol_rc(bol, rc, rules))
+    findings.extend(diff_pod_rc(pod, rc, rules, bol))
+    findings.extend(diff_ditat_rc(ditat, rc, rules))
     findings.extend(diff_bol_pod(bol, pod))
 
     crit = [f for f in findings if f["severity"] == CRIT]
@@ -465,10 +465,11 @@ def run_diff(ditat: dict, extracted: dict) -> dict:
     info = [f for f in findings if f["severity"] == INFO]
 
     if rc is None:
-        # Amazon shipments routinely arrive without a rate confirmation PDF —
-        # downgrade to OK so they don't surface as problematic.
+        # Some customers (e.g. Amazon) routinely arrive without a rate
+        # confirmation PDF — downgrade to OK so they don't surface as problematic.
         customer = _norm_str(ditat.get("customer") if isinstance(ditat, dict) else None)
-        if customer and "amazon" in customer:
+        ok_customers = rules.get("rc_missing_ok_customers") or []
+        if customer and any(c.lower() in customer for c in ok_customers):
             verdict = "OK"
         else:
             verdict = "RC MISSING"

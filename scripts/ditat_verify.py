@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-"""Ditat shipment verification — CLI entrypoint.
+"""Ditat shipment verification — plugin-side CLI entrypoint.
 
-Sub-commands:
-  check-env        — validate .env / credentials without making API calls.
-  fetch            — list unprocessed shipments, download docs in parallel,
-                     emit slim JSON, persist `.ditat_batch.json` sidecar AND
+The credentialed half (talking to Ditat, downloading PDFs) now lives in the
+cloud server (see server/). This CLI drives the LOCAL half:
+
+  check-server     — validate server config + ping /health.
+  pull             — POST the server's /batch, download every doc to disk, emit
+                     slim JSON + persist `.ditat_batch.json` sidecar AND
                      pre-build `.ditat_findings.json` skeleton for `finalize`.
-  verify-one       — same shape as `fetch` but for a single shipment_key.
   append-findings  — merge a chunk's extracted records into
-                     `.ditat_findings.json` atomically (replaces ad-hoc
-                     per-chunk Python the agent used to write).
-  finalize         — consume agent findings + sidecar → diff + mark + ONE
-                     batch .docx. Single transaction.
-  mark             — mark a single shipment processed (used by verify-one).
-  status           — show recent processed-shipment rows.
-  reset            — clear processed flag for a shipment.
+                     `.ditat_findings.json` atomically.
+  finalize         — consume agent findings + sidecar → diff (rules.yaml) → ONE
+                     batch .docx.
 
+No state DB — every run verifies the full window the server returns.
 Stdout is JSON, stderr is logs.
 """
 
@@ -26,25 +24,14 @@ import json
 import logging
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
-from ditat import db as state_db
 from ditat import diff as diff_mod
-from ditat.api import (
-    DitatApiError,
-    DocumentService,
-    ShipmentService,
-    ci_get,
-    document_key,
-    shipment_key,
-)
-from ditat.client import DitatClient
-from ditat.config import Config
-from ditat.ditat_record import slim_ditat
+from ditat import rules as rules_mod
 from ditat.docx_report import build_batch_docx
 from ditat.logging_utils import setup_logging
+from ditat.remote import ServerConfig, download_docs, fetch_batch
 
 log = logging.getLogger("ditat")
 
@@ -59,63 +46,28 @@ def _state_root() -> Path:
     ).resolve()
 
 
-STATE_DB = _state_root() / os.getenv("DITAT_STATE_DB_NAME", "state.db")
 REPORTS_DIR = Path(os.getenv("DITAT_REPORTS_DIR") or (_state_root() / "reports"))
+DOWNLOAD_DIR = Path(os.getenv("DITAT_DOWNLOAD_DIR") or (_state_root() / "downloads"))
 BATCH_SIDECAR = _state_root() / ".ditat_batch.json"
 FINDINGS_FILE = _state_root() / ".ditat_findings.json"
 
 MAX_FINDINGS_BYTES = 50 * 1024 * 1024  # 50 MB defensive cap
 
-# Ditat shipment-lookup column for delivery date. Exact name unconfirmed —
-# override via --filter-column if the API rejects it.
-DELIVERY_DATE_COLUMN = "deliveryDate"
 
-
-# ---------------------------------------------------------------- findings skeleton
-
-def _classify_docs(documents: list[dict]) -> dict:
-    """Group a shipment's documents by classification and compute docs_missing.
-
-    Falls back to filename heuristic when `classification` is UNKNOWN.
-    """
-    rc, bol, pod = [], [], []
-    for d in documents or []:
-        cls = (d.get("classification") or "").upper()
-        if cls == "UNKNOWN":
-            cls = _classify(d.get("file_name") or "")
-        if cls == "RC":
-            rc.append(d)
-        elif cls == "BOL":
-            bol.append(d)
-        elif cls == "POD":
-            pod.append(d)
-    missing = []
-    if not rc:
-        missing.append("RC")
-    if not bol:
-        missing.append("BOL")
-    if not pod:
-        missing.append("POD")
-    return {"rc": rc, "bol": bol, "pod": pod, "docs_missing": missing}
-
+# ---------------------------------------------------------------- sidecar + findings
 
 def _findings_skeleton(batch_records: list[dict]) -> dict:
-    """Build the initial findings file from a batch.
+    """Build the initial findings file from downloaded batch records.
 
     Each shipment gets an empty `extracted` dict (the agent fills it after
-    reading PDFs) and a pre-computed `docs_missing` list. Shipments with no
-    RC/BOL/POD at all (e.g. invoice-only) are fully resolved and the agent
-    skips reading them entirely.
+    reading PDFs) and the server-computed `docs_missing` list.
     """
-    shipments = []
-    for entry in batch_records:
-        grouped = _classify_docs(entry.get("documents") or [])
-        shipments.append({
-            "shipment_key": entry.get("shipment_key"),
-            "shipment_id":  entry.get("shipment_id"),
-            "extracted":    {},
-            "docs_missing": grouped["docs_missing"],
-        })
+    shipments = [{
+        "shipment_key": r.get("shipment_key"),
+        "shipment_id":  r.get("shipment_id"),
+        "extracted":    {},
+        "docs_missing": r.get("docs_missing") or [],
+    } for r in batch_records]
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "shipments": shipments,
@@ -124,76 +76,16 @@ def _findings_skeleton(batch_records: list[dict]) -> dict:
 
 def _write_findings(doc: dict) -> None:
     FINDINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    FINDINGS_FILE.write_text(
-        json.dumps(doc, default=str, indent=2), encoding="utf-8"
-    )
+    FINDINGS_FILE.write_text(json.dumps(doc, default=str, indent=2), encoding="utf-8")
 
 
-# ---------------------------------------------------------------- helpers
-
-def _build_services(config: Config):
-    client = DitatClient(config.base_url, config.account_id, config.client_id, config.client_secret)
-    return client, ShipmentService(client), DocumentService(client)
-
-
-_CLASSIFY_TOKEN_RE = {
-    "RC":  __import__("re").compile(r"\b(rc|ratecon|rate[\s_-]?con(?:firmation)?|ratecnf)\b", __import__("re").I),
-    "POD": __import__("re").compile(r"\b(pod|proof[\s_-]?of[\s_-]?delivery|delivery[\s_-]?receipt)\b", __import__("re").I),
-    "BOL": __import__("re").compile(r"\b(bol|bill[\s_-]?of[\s_-]?lading)\b", __import__("re").I),
-}
-
-
-def _classify(file_name: str) -> str:
-    """Classify a doc by filename. Word-boundary aware: matches standalone
-    " RC ", " BOL ", " POD " tokens that carriers use, not just hyphenated
-    forms like "rate-con".
-    """
-    n = file_name or ""
-    # Order matters: POD's substrings can collide with BOL; check POD first.
-    if _CLASSIFY_TOKEN_RE["RC"].search(n):
-        return "RC"
-    if _CLASSIFY_TOKEN_RE["POD"].search(n):
-        return "POD"
-    if _CLASSIFY_TOKEN_RE["BOL"].search(n):
-        return "BOL"
-    return "UNKNOWN"
-
-
-def _process_one(shipment_obj: dict, details: dict, config: Config,
-                 document_svc: DocumentService, download_workers: int = 3) -> dict | None:
-    key = shipment_key(shipment_obj)
-    if not key:
-        return None
-    docs = document_svc.list_documents(details)
-    out_dir = config.download_dir / str(key)
-
-    def _dl(d: dict) -> dict | None:
-        path = document_svc.download(d, shipment_key=key, out_dir=out_dir)
-        if not path:
-            return None
-        file_name = d.get("fileName") or d.get("FileName") or path.name
-        return {
-            "doc_key":   document_key(d),
-            "file_name": file_name,
-            "file_type": d.get("fileType") or d.get("FileType"),
-            "classification": _classify(file_name),
-            "path":      str(path.resolve()),
-        }
-
-    doc_records: list[dict] = []
-    if docs:
-        workers = max(1, min(download_workers, len(docs)))
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            for rec in ex.map(_dl, docs):
-                if rec is not None:
-                    doc_records.append(rec)
-
-    return {
-        "shipment_key": key,
-        "shipment_id":  ci_get(shipment_obj, "id", "shipmentId"),
-        "ditat_fields": slim_ditat(details),
-        "documents":    doc_records,
-    }
+def _write_sidecar(records: list[dict]) -> None:
+    BATCH_SIDECAR.parent.mkdir(parents=True, exist_ok=True)
+    BATCH_SIDECAR.write_text(json.dumps({
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(records),
+        "shipments": records,
+    }, default=str, indent=2), encoding="utf-8")
 
 
 def _slim_for_stdout(rec: dict) -> dict:
@@ -209,135 +101,60 @@ def _slim_for_stdout(rec: dict) -> dict:
     }
 
 
-def _write_sidecar(records: list[dict]) -> None:
-    BATCH_SIDECAR.parent.mkdir(parents=True, exist_ok=True)
-    BATCH_SIDECAR.write_text(json.dumps({
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "count": len(records),
-        "shipments": records,
-    }, default=str, indent=2), encoding="utf-8")
-
-
 # ---------------------------------------------------------------- commands
 
-def cmd_check_env(_args: argparse.Namespace) -> int:
-    config = Config()
+def cmd_check_server(_args: argparse.Namespace) -> int:
+    config = ServerConfig()
     ok, missing = config.validate()
-    print(json.dumps({
+    result = {
         "ok": ok,
         "missing": missing,
-        "base_url": config.base_url,
-        "download_dir": str(config.download_dir.resolve()),
-        "state_db": str(STATE_DB.resolve()),
-        "batch_sidecar": str(BATCH_SIDECAR.resolve()),
-    }, indent=2))
-    return 0 if ok else 2
+        "server_url": config.base_url,
+        "auth": "api-key" if config.api_key else "none",
+    }
+    if ok:
+        import requests
+        try:
+            r = requests.get(f"{config.base_url}/health", headers=config._headers(), timeout=30)
+            result["health_status"] = r.status_code
+            result["health"] = r.json() if "json" in r.headers.get("Content-Type", "") else r.text[:200]
+        except Exception as e:  # noqa: BLE001
+            result["ok"] = False
+            result["health_error"] = str(e)
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 2
 
 
-def cmd_fetch(args: argparse.Namespace) -> int:
-    config = Config()
+def cmd_pull(args: argparse.Namespace) -> int:
+    config = ServerConfig()
     ok, missing = config.validate()
     if not ok:
-        print(json.dumps({"error": f"missing env vars: {missing}"}), file=sys.stderr)
+        print(json.dumps({"error": f"missing server config: {missing}"}), file=sys.stderr)
         return 2
 
-    _, shipment_svc, document_svc = _build_services(config)
-
-    if args.last_week:
-        args.since_days = 7
-    elif args.last_month:
-        args.since_days = 30
-
-    # --last-week means "delivered last week" → filter on delivery date, not
-    # updatedOn. Explicit --filter-column always wins.
-    if args.filter_column is None:
-        filter_column = DELIVERY_DATE_COLUMN if args.last_week else "updatedOn"
-    else:
-        filter_column = args.filter_column
-
-    since = None if args.all else datetime.now(timezone.utc) - timedelta(days=args.since_days)
-    shipments = shipment_svc.list_shipments(
-        since=since,
-        filter_column=filter_column,
+    since_days = 30 if args.last_month else args.since_days
+    manifest = fetch_batch(
+        config,
+        since_days=since_days,
+        last_week=args.last_week,
+        all_time=args.all,
+        filter_column=args.filter_column,
+        limit=args.limit,
         page_size=args.page_size,
+        require_docs=args.require_docs,
     )
 
-    processed = state_db.processed_keys(STATE_DB)
+    log.info("Manifest: %d shipments — downloading docs", manifest.get("count", 0))
+    records = download_docs(config, manifest, DOWNLOAD_DIR)
 
-    pending: list[tuple[str, dict]] = []
-    for s in shipments:
-        if len(pending) >= args.limit:
-            break
-        k = shipment_key(s)
-        if not k:
-            continue
-        if not args.include_processed and k in processed:
-            continue
-        pending.append((k, s))
-
-    log.info("Processing %d shipments with %d workers", len(pending), args.workers)
-
-    def _one(item: tuple[str, dict]) -> dict | None:
-        k, s = item
-        try:
-            details = shipment_svc.get_details(k)
-        except Exception as e:
-            log.error("detail fetch failed for %s: %s", k, e)
-            return None
-        return _process_one(s, details, config, document_svc, download_workers=args.doc_workers)
-
-    out: list[dict] = []
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
-        for rec in ex.map(_one, pending):
-            if rec is None:
-                continue
-            if args.require_docs and not rec["documents"]:
-                continue
-            out.append(rec)
-
-    _write_sidecar(out)
-    _write_findings(_findings_skeleton(out))
+    _write_sidecar(records)
+    _write_findings(_findings_skeleton(records))
 
     print(json.dumps({
-        "count": len(out),
-        "batch_sidecar":  str(BATCH_SIDECAR.resolve()),
-        "findings_file":  str(FINDINGS_FILE.resolve()),
-        "shipments": [_slim_for_stdout(r) for r in out],
-    }, default=str, indent=2))
-    return 0
-
-
-def cmd_verify_one(args: argparse.Namespace) -> int:
-    config = Config()
-    ok, missing = config.validate()
-    if not ok:
-        print(json.dumps({"error": f"missing env vars: {missing}"}), file=sys.stderr)
-        return 2
-
-    if not args.shipment_key.isdigit():
-        log.warning("verify-one key '%s' is non-numeric — Ditat keys are usually numeric strings.",
-                    args.shipment_key)
-
-    _, shipment_svc, document_svc = _build_services(config)
-    try:
-        details = shipment_svc.get_details(args.shipment_key)
-    except DitatApiError as e:
-        print(json.dumps({"error": f"detail fetch failed: {e}"}), file=sys.stderr)
-        return 1
-
-    stub = {"Key": args.shipment_key}
-    rec = _process_one(stub, details, config, document_svc)
-    if not rec:
-        print(json.dumps({"error": "could not extract shipment key"}), file=sys.stderr)
-        return 1
-
-    _write_sidecar([rec])
-    _write_findings(_findings_skeleton([rec]))
-    print(json.dumps({
-        "count": 1,
-        "batch_sidecar":  str(BATCH_SIDECAR.resolve()),
-        "findings_file":  str(FINDINGS_FILE.resolve()),
-        "shipments": [_slim_for_stdout(rec)],
+        "count": len(records),
+        "batch_sidecar": str(BATCH_SIDECAR.resolve()),
+        "findings_file": str(FINDINGS_FILE.resolve()),
+        "shipments": [_slim_for_stdout(r) for r in records],
     }, default=str, indent=2))
     return 0
 
@@ -349,8 +166,7 @@ def cmd_append_findings(args: argparse.Namespace) -> int:
       A) [ {"shipment_key": "...", "extracted": {...}, "docs_missing": [...]}, ... ]
       B) {"shipments": [ ...same as A... ]}
 
-    Replaces ad-hoc per-chunk Python the agent used to write. Atomic merge:
-    last-write-wins per shipment_key, missing keys preserved.
+    Atomic merge: last-write-wins per shipment_key, missing keys preserved.
     """
     src = Path(args.input)
     if not src.is_absolute():
@@ -371,7 +187,7 @@ def cmd_append_findings(args: argparse.Namespace) -> int:
 
     if not FINDINGS_FILE.exists():
         print(json.dumps({
-            "error": f"findings file not found: {FINDINGS_FILE} (run `fetch` first)"
+            "error": f"findings file not found: {FINDINGS_FILE} (run `pull` first)"
         }), file=sys.stderr)
         return 1
 
@@ -418,7 +234,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         batch_path = _state_root() / batch_path
     if not batch_path.exists():
         print(json.dumps({
-            "error": f"batch sidecar not found: {batch_path} (run `fetch` or `verify-one` first)"
+            "error": f"batch sidecar not found: {batch_path} (run `pull` first)"
         }), file=sys.stderr)
         return 1
 
@@ -428,9 +244,11 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     except json.JSONDecodeError as e:
         print(json.dumps({
             "error": f"invalid JSON in input: {e}",
-            "hint":  "findings.json must match the schema in SKILL.md Step 3.",
+            "hint":  "findings.json must match the schema in SKILL.md.",
         }), file=sys.stderr)
         return 1
+
+    rules = rules_mod.load_rules(args.rules_file)
 
     batch_records: list[dict] = batch_doc.get("shipments") or []
     findings_list: list[dict] = findings_doc.get("shipments") or []
@@ -449,7 +267,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         key = str(entry.get("shipment_key") or "")
         ditat = entry.get("ditat_fields") or {}
         extracted = findings_index.get(key) or {}
-        diff_index[key] = diff_mod.run_diff(ditat, extracted)
+        diff_index[key] = diff_mod.run_diff(ditat, extracted, rules)
 
     if args.output:
         out_path = Path(args.output)
@@ -464,27 +282,18 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         anomalies_only=getattr(args, "anomalies_only", True),
     )
 
-    rows = []
+    problem_rows = []
     for entry in batch_records:
         key = entry.get("shipment_key")
         d = diff_index.get(str(key)) or {}
-        rows.append({
-            "shipment_key": key,
-            "shipment_id":  entry.get("shipment_id"),
-            "report_path":  str(out_path),
-            "critical":     d.get("critical_count", 0),
-            "warn":         d.get("warn_count", 0),
-            "verdict":      d.get("verdict"),
-        })
-    state_db.mark_batch(STATE_DB, rows)
-
-    problem_rows = [{
-        "shipment_key": r["shipment_key"],
-        "shipment_id":  r["shipment_id"],
-        "verdict":      r["verdict"],
-        "critical":     r["critical"],
-        "warn":         r["warn"],
-    } for r in rows if r["verdict"] in {"ISSUES", "WARN", "RC MISSING"}]
+        if d.get("verdict") in {"ISSUES", "WARN", "RC MISSING"}:
+            problem_rows.append({
+                "shipment_key": key,
+                "shipment_id":  entry.get("shipment_id"),
+                "verdict":      d.get("verdict"),
+                "critical":     d.get("critical_count", 0),
+                "warn":         d.get("warn_count", 0),
+            })
 
     print(json.dumps({
         "docx": str(out_path.resolve()),
@@ -495,111 +304,54 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     }, indent=2))
 
     if args.cleanup:
-        try:
-            batch_path.unlink()
-        except OSError:
-            pass
-        try:
-            findings_path.unlink()
-        except OSError:
-            pass
+        for p in (batch_path, findings_path):
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
-    return 0
-
-
-def cmd_mark(args: argparse.Namespace) -> int:
-    state_db.mark_one(
-        STATE_DB,
-        shipment_key=args.shipment_key,
-        shipment_id=args.shipment_id,
-        report_path=args.report_path,
-        critical=args.critical,
-        warn=args.warn,
-        verdict=args.verdict,
-    )
-    print(json.dumps({"marked": args.shipment_key}))
-    return 0
-
-
-def cmd_status(args: argparse.Namespace) -> int:
-    print(json.dumps(state_db.recent_status(STATE_DB, limit=args.limit), indent=2))
-    return 0
-
-
-def cmd_reset(args: argparse.Namespace) -> int:
-    state_db.reset(STATE_DB, args.shipment_key)
-    print(json.dumps({"reset": args.shipment_key}))
     return 0
 
 
 # ---------------------------------------------------------------- main
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Ditat shipment verification helper")
+    p = argparse.ArgumentParser(description="Ditat shipment verification helper (plugin side)")
     p.add_argument("--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    e = sub.add_parser("check-env", help="Validate .env / credentials")
-    e.set_defaults(func=cmd_check_env)
+    c = sub.add_parser("check-server", help="Validate server config + ping /health")
+    c.set_defaults(func=cmd_check_server)
 
-    f = sub.add_parser("fetch", help="List + download unprocessed shipments (parallel)")
-    f.add_argument("--limit", type=int, default=500)
-    f.add_argument("--since-days", type=int, default=30)
-    f.add_argument("--last-week", action="store_true")
-    f.add_argument("--last-month", action="store_true")
-    f.add_argument("--all", action="store_true")
-    f.add_argument("--filter-column", default=None,
-                   help="Ditat lookup column for the time window. Default: "
-                        "'updatedOn'; --last-week defaults to delivery date "
-                        f"('{DELIVERY_DATE_COLUMN}'). Override if Ditat rejects the name.")
-    f.add_argument("--include-processed", action="store_true")
-    f.add_argument("--require-docs", action="store_true", default=True)
-    f.add_argument("--workers", type=int, default=5)
-    f.add_argument("--doc-workers", type=int, default=3)
-    f.add_argument("--page-size", type=int, default=1000,
-                   help="Server-side page size for list_shipments (default: 1000)")
-    f.set_defaults(func=cmd_fetch)
-
-    v = sub.add_parser("verify-one", help="Fetch + download docs for one shipment")
-    v.add_argument("shipment_key")
-    v.set_defaults(func=cmd_verify_one)
+    pl = sub.add_parser("pull", help="Fetch manifest from server + download docs")
+    pl.add_argument("--limit", type=int, default=500)
+    pl.add_argument("--since-days", type=int, default=30)
+    pl.add_argument("--last-week", action="store_true")
+    pl.add_argument("--last-month", action="store_true")
+    pl.add_argument("--all", action="store_true")
+    pl.add_argument("--filter-column", default=None)
+    pl.add_argument("--require-docs", action="store_true", default=True)
+    pl.add_argument("--page-size", type=int, default=1000)
+    pl.set_defaults(func=cmd_pull)
 
     fz = sub.add_parser("finalize",
-                        help="Diff + mark + render docx from agent findings + batch sidecar")
-    fz.add_argument("--findings-file", default=str(FINDINGS_FILE),
-                    help="Default: .ditat_findings.json in project dir")
+                        help="Diff + render docx from agent findings + batch sidecar")
+    fz.add_argument("--findings-file", default=str(FINDINGS_FILE))
     fz.add_argument("--batch-file", default=None)
+    fz.add_argument("--rules-file", default=None,
+                    help="Path to rules.yaml. Default: auto-discover (scripts/rules.yaml).")
     fz.add_argument("--output", default=None)
     fz.add_argument("--cleanup", action="store_true",
                     help="Delete sidecar + findings files after success (default: keep)")
     fz.add_argument("--anomalies-only", action="store_true", default=True,
-                    help="Docx contains only problematic shipments + counts header "
-                         "(no full summary table). Default: on.")
+                    help="Docx contains only problematic shipments + counts header. Default: on.")
     fz.add_argument("--full-report", dest="anomalies_only", action="store_false",
                     help="Include full summary table of every shipment in docx.")
     fz.set_defaults(func=cmd_finalize)
 
-    af = sub.add_parser("append-findings",
-                        help="Merge chunk records into .ditat_findings.json")
+    af = sub.add_parser("append-findings", help="Merge chunk records into .ditat_findings.json")
     af.add_argument("input", help="Path to chunk JSON file (list or {shipments:[...]})")
     af.set_defaults(func=cmd_append_findings)
-
-    m = sub.add_parser("mark", help="Mark one shipment processed (verify-one path)")
-    m.add_argument("shipment_key")
-    m.add_argument("--shipment-id", default=None)
-    m.add_argument("--report-path", default=None)
-    m.add_argument("--critical", type=int, default=0)
-    m.add_argument("--warn", type=int, default=0)
-    m.add_argument("--verdict", default=None)
-    m.set_defaults(func=cmd_mark)
-
-    s = sub.add_parser("status", help="Show recent processed-shipment status")
-    s.add_argument("--limit", type=int, default=20)
-    s.set_defaults(func=cmd_status)
-
-    r = sub.add_parser("reset", help="Clear processed flag for a shipment")
-    r.add_argument("shipment_key")
-    r.set_defaults(func=cmd_reset)
 
     args = p.parse_args()
     setup_logging(args.verbose)
@@ -611,7 +363,7 @@ def main() -> int:
             "error": f"missing dependency: {e}. Run: pip install -r scripts/requirements.txt"
         }), file=sys.stderr)
         return 2
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         log.exception("helper failed")
         print(json.dumps({"error": str(e)}), file=sys.stderr)
         return 1

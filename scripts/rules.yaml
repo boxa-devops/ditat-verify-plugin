@@ -1,0 +1,47 @@
+# Ditat verification rules — thresholds and accessorial policy.
+#
+# Edit this file to tune what counts as a problem. Anything you omit falls back
+# to the built-in default (see scripts/ditat/rules.py), so a partial file is OK.
+# Severities are one of: critical | warn | info.
+
+# Ditat record vs Rate Confirmation — total weight tolerance.
+weight_ditat_rc:
+  critical_pct: 5.0   # |Δ| above this % → critical
+  warn_pct: 1.0       # |Δ| at/above this % (but ≤ critical) → warn
+
+# BOL vs RC overage — only flag when BOL EXCEEDS RC (under is fine).
+bol_rc_overage:
+  weight_threshold_pct: 10.0   # BOL weight over RC by ≥ this % → critical
+  pieces_threshold_pct: 10.0   # BOL pieces over RC by ≥ this % → critical
+
+# Revenue (Ditat) vs agreed rate (RC).
+money:
+  critical_abs: 1.0   # absolute $ difference above this → critical
+  critical_pct: 1.0   # OR % difference above this → critical
+
+# Date comparisons (pickup / delivery).
+date:
+  critical_days: 1    # |Δ days| greater than this → critical; any non-zero ≤ this → warn
+
+# String fields (commodity, locations, equipment) when they mismatch.
+string_mismatch_severity: warn
+
+# Accessorial policy — company defaults the RC must honor. Terms worse than
+# these mean we'd be undercompensated.
+accessorial:
+  detention_rate: 50.0          # $/hr — RC below this is bad
+  detention_free_hrs: 2.0       # free hrs — RC above this is bad
+  detention_max_hrs: 5.0        # billable cap — RC below this is bad
+  layover_rate: 250.0           # $/24h — RC below this is bad
+  layover_threshold_hrs: 5.0    # wait before layover — RC above this is bad
+  severities:
+    detention_rate: critical
+    detention_free_hrs: critical
+    detention_max_hrs: warn
+    layover_rate: critical
+    layover_threshold_hrs: warn
+
+# Customers for whom a missing RC is acceptable (verdict OK, not RC MISSING).
+# Matched as a case-insensitive substring of the Ditat customer name.
+rc_missing_ok_customers:
+  - amazon

@@ -1,20 +1,31 @@
 ---
 name: ditat-verify
-description: Pull unprocessed shipments from Ditat TMS, download their documents (BOL/POD/Rate Confirmation), and cross-check BOL+POD+Ditat shipment fields against the Rate Confirmation. Produces ONE anomalies-only Word doc (.docx) of problematic shipments and marks every processed shipment in state.db. Trigger when user says "verify ditat shipments", "check ditat", "run ditat verification", "/ditat-verify", or asks to reconcile shipment documents against rate cons.
+description: Pull shipments from the Ditat verification server, download their documents (BOL/POD/Rate Confirmation), and cross-check BOL+POD+Ditat shipment fields against the Rate Confirmation. Produces ONE anomalies-only Word doc (.docx) of problematic shipments. Trigger when user says "verify ditat shipments", "check ditat", "run ditat verification", "/ditat-verify", or asks to reconcile shipment documents against rate cons.
 ---
 
 # Ditat Shipment Verification
 
+## Architecture (split: server + plugin)
+
+The credentialed half lives in a **cloud server** (see `server/`): it holds the
+Ditat API credentials, lists shipments, classifies docs, and streams PDF
+binaries. This **plugin** is the local half: it calls the server, downloads the
+PDFs, has Claude extract fields, runs the deterministic diff against
+`rules.yaml`, and renders the docx.
+
+The plugin never talks to Ditat directly and stores **no state DB** — every run
+verifies the full window the server returns.
+
 ## What it does
 
-For every shipment in a time window that has not been processed yet:
-1. Downloads its PDFs (BOL / POD / Rate Confirmation).
+For every shipment the server returns in a time window:
+1. Downloads its PDFs (BOL / POD / Rate Confirmation) from the server.
 2. Extracts key fields from each PDF (RC is the source of truth).
-3. Cross-checks BOL, POD, and the Ditat shipment record against the RC.
-4. Writes **one anomalies-only Word doc** at `${CLAUDE_PROJECT_DIR}/reports/ditat-verify-<stamp>.docx` containing:
+3. Cross-checks BOL, POD, and the Ditat shipment record against the RC, using
+   the thresholds in `rules.yaml`.
+4. Writes **one anomalies-only Word doc** at `${CLAUDE_PROJECT_DIR}/reports/ditat-verify-<stamp>.docx`:
    - counts header (OK / WARN / ISSUES / RC MISSING),
-   - detail section for **problematic shipments only** — clean shipments are omitted.
-5. Marks every shipment processed in `state.db` so it won't re-run.
+   - detail section for **problematic shipments only** — clean shipments omitted.
 
 The user only cares about the .docx path. No per-shipment markdown files.
 
@@ -22,17 +33,17 @@ The user only cares about the .docx path. No per-shipment markdown files.
 
 - `verify ditat shipments`, `check ditat`, `run ditat verification`, `/ditat-verify`
 - `verify last week` / `verify last month` / `verify last N days`
-- `verify shipment <KEY>` / `re-verify shipment <KEY>` (single-shipment retry)
-- `ditat env check` / `ditat verify status`
+- `ditat server check`
 - "reconcile shipment docs against rate cons" or semantic equivalent
 
-Inputs: time window (defaults to last month). Credentials from `${CLAUDE_PROJECT_DIR}/.env`.
+Inputs: time window (defaults to last month). Server config from `${CLAUDE_PROJECT_DIR}/.env`.
 
 ## Paths
 
 - **Helper script:** `${CLAUDE_PLUGIN_ROOT}/scripts/ditat_verify.py` — always invoke with the full `${CLAUDE_PLUGIN_ROOT}` path.
-- **State** (`state.db`, `reports/`, `downloads/`, token cache, `.env`, `.ditat_batch.json`, `.ditat_findings.json`) lives in `${CLAUDE_PROJECT_DIR}`.
-- **`.env`** at `${CLAUDE_PROJECT_DIR}/.env` with `DITAT_BASE_URL`, `DITAT_ACCOUNT_ID`, `DITAT_CLIENT_ID`, `DITAT_CLIENT_SECRET`. Template at `${CLAUDE_PLUGIN_ROOT}/.env.example`.
+- **State** (`reports/`, `downloads/`, `.env`, `.ditat_batch.json`, `.ditat_findings.json`) lives in `${CLAUDE_PROJECT_DIR}`. No `state.db`.
+- **`.env`** at `${CLAUDE_PROJECT_DIR}/.env` with `DITAT_SERVER_URL` and (optionally) `DITAT_SERVER_API_KEY`. Template at `${CLAUDE_PLUGIN_ROOT}/.env.example`.
+- **`rules.yaml`** at `${CLAUDE_PLUGIN_ROOT}/scripts/rules.yaml` — editable thresholds + accessorial policy. Override path with `--rules-file` or `$DITAT_RULES_PATH`.
 
 Run from the user's current shell — `cwd` is `${CLAUDE_PROJECT_DIR}`.
 
@@ -47,45 +58,42 @@ Run from the user's current shell — `cwd` is `${CLAUDE_PROJECT_DIR}`.
 
 **1b. Python launcher.** Windows: prefer `py` (Python.org launcher); `python` is often the MS Store shim. macOS/Linux: `python3`.
 
-**1c. Env check:**
+**1c. Server check:**
 
 PowerShell (Windows):
 ```
-py "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" check-env
+py "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" check-server
 ```
 Bash:
 ```
-python3 "$CLAUDE_PLUGIN_ROOT/scripts/ditat_verify.py" check-env
+python3 "$CLAUDE_PLUGIN_ROOT/scripts/ditat_verify.py" check-server
 ```
 
-If `ok: false`, copy `${CLAUDE_PLUGIN_ROOT}/.env.example` to `${CLAUDE_PROJECT_DIR}/.env` and fill credentials. Skip preflight on repeat invocations in the same session.
+If `ok: false`, copy `${CLAUDE_PLUGIN_ROOT}/.env.example` to `${CLAUDE_PROJECT_DIR}/.env` and set `DITAT_SERVER_URL` (+ `DITAT_SERVER_API_KEY` if the server requires auth). Skip preflight on repeat invocations in the same session.
 
-### Step 2 — Fetch (one helper call)
+### Step 2 — Pull (one helper call)
 
 ```
-py "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" fetch --last-month
+py "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" pull --last-month
 ```
 
 Flags:
 - `--last-week` / `--last-month` — presets (7 / 30 days). `--last-week` filters on **delivery date** (delivered last week), not `updatedOn`.
-- `--filter-column COL` — Ditat lookup column for the window (default `updatedOn`; `--last-week` defaults to delivery date). Override if Ditat rejects the name.
+- `--filter-column COL` — Ditat lookup column for the window. Override if the server rejects the name.
 - `--since-days N` — custom window
 - `--limit N` — cap (default 500)
 - `--all` — no date filter
-- `--include-processed` — re-verify already-marked shipments
-- `--workers N` — across-shipment parallelism (default 5)
-- `--doc-workers N` — per-shipment doc-download parallelism (default 3)
+- `--page-size N` — server-side page size (default 1000)
 
 Default mapping:
 - "verify last week" → `--last-week`
 - "verify last month" or unspecified → `--last-month`
 - "verify next N shipments" → `--limit N`
-- Single-shipment retry → use `verify-one <KEY>` (same envelope, batch of 1).
 
-`fetch` does THREE things in one call:
-1. Downloads docs to `${CLAUDE_PROJECT_DIR}/downloads/<key>/`.
+`pull` does THREE things in one call:
+1. POSTs the server's `/batch` and downloads each doc to `${CLAUDE_PROJECT_DIR}/downloads/<key>/`.
 2. Writes `.ditat_batch.json` (full Ditat record per shipment).
-3. **Writes `.ditat_findings.json` skeleton** — every shipment pre-populated with `extracted: {}` and `docs_missing` pre-computed (so invoice-only / partial shipments need NO PDF reading).
+3. **Writes `.ditat_findings.json` skeleton** — every shipment pre-populated with `extracted: {}` and `docs_missing` pre-computed by the server (so invoice-only / partial shipments need NO PDF reading).
 
 Stdout JSON:
 ```json
@@ -106,7 +114,7 @@ Stdout JSON:
 }
 ```
 
-If `count == 0`: tell user "no unprocessed shipments" and stop. **Do not call `finalize`.**
+If `count == 0`: tell user "no shipments in this window" and stop. **Do not call `finalize`.**
 
 ### Step 3 — Read PDFs + extract (big parallel chunks, one merge per chunk)
 
@@ -193,17 +201,17 @@ Rules:
 py "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" finalize
 ```
 
-Defaults: reads `.ditat_findings.json` and `.ditat_batch.json` from project dir; renders **anomalies-only** docx (counts header + problem shipments only).
+Defaults: reads `.ditat_findings.json` and `.ditat_batch.json` from project dir; loads `rules.yaml`; renders **anomalies-only** docx (counts header + problem shipments only).
 
-The helper in one transaction:
-1. Runs cross-checks with the rules below.
-2. Marks every shipment processed in `state.db`.
+The helper:
+1. Loads thresholds from `rules.yaml` (falls back to built-in defaults if absent).
+2. Runs cross-checks with the rules below.
 3. Builds **one `.docx`** with counts header + detail section for problematic shipments only.
 4. Optionally deletes the sidecar + findings.
 
-**Cross-check rules:**
+**Cross-check rules** (defaults — all tunable in `rules.yaml`):
 
-| Pair          | Field                          | Rule                                                                   |
+| Pair          | Field                          | Rule (default)                                                         |
 |---------------|--------------------------------|------------------------------------------------------------------------|
 | RC-policy     | detention_rate                 | RC < $50/hr → critical; missing → warn                                 |
 | RC-policy     | detention_free_hrs             | RC > 2 hrs → critical; missing → warn                                  |
@@ -221,14 +229,14 @@ The helper in one transaction:
 | POD↔RC        | damages_notes                  | any damages → warn                                                     |
 | Ditat↔RC      | total_weight_lbs               | weight Δ > 5% → critical; ≥1% → warn                                   |
 | Ditat↔RC      | total_pieces                   | any diff → critical                                                    |
-| Ditat↔RC      | bol_number, load_number        | id mismatch → critical (Ditat sources: `loadId` / `loadNumber`)        |
-| Ditat↔RC      | equipment_type                 | normalized string compare (Ditat source: `equipment` / `equipmentType`) |
+| Ditat↔RC      | bol_number, load_number        | id mismatch → critical                                                 |
+| Ditat↔RC      | equipment_type                 | normalized string compare                                              |
 | Ditat↔RC      | pickup_location, delivery_location | city + state only via normalized compare; full address not required |
-| Ditat↔RC      | revenue_vs_rate                | money Δ > $1 → critical (Ditat sources: revenue sum / `revenue` scalar) |
+| Ditat↔RC      | revenue_vs_rate                | money Δ > $1 → critical                                                |
 | BOL↔POD       | bol_number                     | id mismatch → critical (weight + pieces dropped — POD unreliable)      |
 
 **Special-case verdict:**
-- RC missing **and** customer name contains `amazon` → verdict downgraded from `RC MISSING` to `OK`. Amazon shipments routinely arrive without an RC PDF.
+- RC missing **and** customer name matches an entry in `rc_missing_ok_customers` (default: `amazon`) → verdict downgraded from `RC MISSING` to `OK`.
 
 Output JSON:
 ```json
@@ -245,6 +253,7 @@ Flags:
 - `--output <path>` — override docx output location
 - `--findings-file <path>` — override findings path (default: `.ditat_findings.json`)
 - `--batch-file <path>` — override sidecar path
+- `--rules-file <path>` — override rules.yaml path
 - `--cleanup` — delete sidecar + findings after success
 - `--full-report` — include all-shipments summary table in docx (default omits it)
 
@@ -261,40 +270,37 @@ SH-0000009586      RC MISSING    0         1
 ```
 
 **Net turns per batch:**
-- ≤10 shipments: ~3 turns (preflight optional + fetch + 1 parallel-Read turn + finalize). With finalize that's still 3 distinct CLI calls, but the heavy lifting is one big parallel-Read.
-- 45 shipments: preflight + fetch + ~4-5 chunked parallel-Read+append turns + finalize ≈ 7-8 turns.
+- ≤10 shipments: ~3 turns (preflight optional + pull + 1 parallel-Read turn + finalize).
+- 45 shipments: preflight + pull + ~4-5 chunked parallel-Read+append turns + finalize ≈ 7-8 turns.
 - 100 shipments: ~12 turns total.
 
 ## Sub-commands user may invoke directly
 
-- `verify last week` → `fetch --last-week`, full flow
-- `verify last month` / `verify ditat shipments` → `fetch --last-month`, full flow
-- `verify next N shipments` → `fetch --limit N`, full flow
-- `verify shipment <KEY>` → `verify-one <KEY>`, then `finalize` as a batch of 1
-- `ditat verify status` → `status` subcommand
-- `ditat env check` → `check-env`
+- `verify last week` → `pull --last-week`, full flow
+- `verify last month` / `verify ditat shipments` → `pull --last-month`, full flow
+- `verify next N shipments` → `pull --limit N`, full flow
+- `ditat server check` → `check-server`
 
 ## Operational notes
 
-- **Token budget.** Ditat enforces 12 token-fetches/hour. Helper reuses cached token at `${CLAUDE_PROJECT_DIR}/.ditat_token_*.json`.
-- **Permission gap.** If the Ditat user lacks the `documents` View role, docs list is empty even when files exist. Helper logs a warning; affected shipments get `RC MISSING` verdict.
-- **Concurrent runs.** State.db uses WAL + busy_timeout=5s; two overlapping invocations won't corrupt state.
-- **`.ditat_batch.json`** carries the full Ditat record for each shipment so `finalize` can diff without re-hitting the API. Delete manually if a fetch was aborted.
-- **`.ditat_findings.json`** is the skeleton populated by `fetch` and filled in by the agent via `append-findings`. Don't hand-edit; use the CLI.
+- **Server holds the credentials.** The plugin only needs `DITAT_SERVER_URL` (+ API key). Ditat's token budget, permissions, and retries are the server's concern.
+- **No state DB.** Every run verifies the whole window. There is no processed-ledger and no `mark`/`status`/`reset`.
+- **`.ditat_batch.json`** carries the full Ditat record + local doc paths so `finalize` can diff without re-hitting the server. Delete manually if a pull was aborted.
+- **`.ditat_findings.json`** is the skeleton populated by `pull` and filled in by the agent via `append-findings`. Don't hand-edit; use the CLI.
+- **`rules.yaml`** is the single place to tune thresholds. A partial file is fine — omitted keys fall back to defaults.
 
 ## Anti-patterns — DO NOT do these
 
 These break the pipeline. Reject the impulse:
 
-- **Do NOT write custom Python scripts to init/append/stub findings.** Use `fetch` (writes skeleton) and `append-findings <chunk.json>` (merges chunks). One-off scripts like `_init_findings.py`, `_append_findings.py`, `_chunk_records.json` are forbidden — the helper CLI covers every step.
-- **Do NOT shrink chunks to 3-5 shipments "to be safe".** Default is 10 shipments × 3 PDFs = 30 parallel Reads per turn. This is the entire performance optimization. Shrinking it doubles or triples session time.
-- **Do NOT read PDFs for shipments where the skeleton already says `docs_missing: ["RC","BOL","POD"]`.** That shipment is invoice-only / no docs; `finalize` handles it with verdict `RC MISSING`. Skip it entirely.
-- **Do NOT diff in your head.** Just extract fields. The deterministic diff is in `ditat/diff.py`.
+- **Do NOT write custom Python scripts to init/append/stub findings.** Use `pull` (writes skeleton) and `append-findings <chunk.json>` (merges chunks). One-off scripts are forbidden — the helper CLI covers every step.
+- **Do NOT shrink chunks to 3-5 shipments "to be safe".** Default is 10 shipments × 3 PDFs = 30 parallel Reads per turn. This is the entire performance optimization.
+- **Do NOT read PDFs for shipments where the skeleton already says `docs_missing: ["RC","BOL","POD"]`.** That shipment is invoice-only; `finalize` handles it with verdict `RC MISSING`. Skip it.
+- **Do NOT diff in your head.** Just extract fields. The deterministic diff is in `ditat/diff.py`, thresholds in `rules.yaml`.
 - **Do NOT write per-shipment `reports/<key>.md` files.** The deliverable is the one batch `.docx`.
-- **Do NOT call `mark` from the agent during a batch run.** `finalize` marks every shipment in one transaction.
-- **Do NOT skip `finalize` because "some shipments are incomplete".** It works with whatever is in findings.json; missing docs are fine.
+- **Do NOT call Ditat directly from the plugin.** The server owns that. The plugin only knows the server URL.
 - **Do NOT write helper output into the plugin directory** (`$CLAUDE_PLUGIN_ROOT`). All state lives in `$CLAUDE_PROJECT_DIR`.
-- **Do NOT retry the same failing Read.** Record the doc type in `docs_missing` and move on. Likely scanned PDF with bad OCR — move on.
+- **Do NOT retry the same failing Read.** Record the doc type in `docs_missing` and move on.
 
 If you find yourself writing Python to work around a step, STOP and re-read this file. The helper CLI already covers it.
 
@@ -308,9 +314,8 @@ Translate every failure into the next action; never dump errors silently.
 |---|---|
 | `python` resolves to MS Store shim (exit 49) | Re-run with `py` instead of `python`. Tell user once. |
 | Neither `py`, `python`, nor `python3` works | Tell user to install Python 3.10+ from python.org. Stop. |
-| `python-docx` / `requests` / `python-dotenv` import error | Run `py -m pip install -r "$env:CLAUDE_PLUGIN_ROOT\scripts\requirements.txt"`. The `SessionStart` hook normally handles this. |
+| `python-docx` / `requests` / `python-dotenv` / `PyYAML` import error | Run `py -m pip install -r "$env:CLAUDE_PLUGIN_ROOT\scripts\requirements.txt"`. The `SessionStart` hook normally handles this. |
 | `$CLAUDE_PLUGIN_ROOT` empty | Plugin not installed/active. Tell user to run `/plugin install ditat-verify@ditat-tools` and restart session. |
-| `UnicodeEncodeError` on ad-hoc Python (Cyrillic paths) | Set `$env:PYTHONIOENCODING = "utf-8"` before the call. Better: avoid ad-hoc one-liners; use the CLI. |
 
 ### Project directory
 
@@ -320,40 +325,25 @@ Translate every failure into the next action; never dump errors silently.
 | Set but folder missing | Create with `mkdir -p` / `New-Item -ItemType Directory -Force`. Continue. |
 | cwd is the plugin folder | Refuse. cd out to a customer-owned folder first; plugin updates would wipe state. |
 
-### Credentials
+### Server
 
 | Condition | What to do |
 |---|---|
-| `check-env` returns `ok: false` | Tell user which vars (in JSON). Offer to copy `.env.example`. Don't proceed to fetch. |
-| HTTP 401 / "invalid_client" on first fetch | Creds wrong. Confirm with Ditat admin. Don't retry — burns 12/hr budget. |
-| `TokenFetchLimitExceeded` | Hit 3-per-process cap. Wait, fix creds, re-run. |
-
-### Ditat permissions
-
-| Condition | What to do |
-|---|---|
-| API returns code 900 on `includeDocuments=true` | Helper auto-retries without the flag; docs list will be empty. Tell admin to grant Documents View. Continue — affected shipments get `RC MISSING`. |
-| Same for notes | Warn once, continue. |
+| `check-server` returns `ok: false` with `DITAT_SERVER_URL` missing | Set `DITAT_SERVER_URL` in `${CLAUDE_PROJECT_DIR}/.env`. Don't proceed to pull. |
+| `check-server` `health_status: 401` | Server requires auth. Set `DITAT_SERVER_API_KEY` to match the server's key. |
+| `check-server` `health` shows `misconfigured` | The SERVER is missing Ditat creds. Whoever runs the server must set them. |
+| `pull` returns `server /batch returned 503` | Server can't reach Ditat / missing creds. Server-side fix needed. |
+| `pull` returns `server /batch returned 5xx` | Transient server/Ditat error. Retry once; if it persists, check server logs. |
 
 ### Data flow
 
 | Condition | What to do |
 |---|---|
-| `fetch` returns `count: 0` | "No unprocessed shipments in this window." Stop. Don't call `finalize`. Offer wider window or `--include-processed`. |
-| Every shipment has `documents: []` | Likely permission gap. Warn; let `finalize` run for Ditat-only checks. |
-| One shipment has fewer docs than expected | Normal — `fetch` pre-fills `docs_missing` for you. Skip PDF reads for it. |
+| `pull` returns `count: 0` | "No shipments in this window." Stop. Don't call `finalize`. Offer a wider window. |
+| One shipment has fewer docs than expected | Normal — `pull` pre-fills `docs_missing` for you. Skip PDF reads for it. |
 | PDF Read returns empty/truncated | Don't retry. Add the doc type to `docs_missing` for that shipment. |
-| `finalize` says `batch sidecar not found` | Re-run `fetch` or `verify-one`. |
-| `finalize` says `findings file not found` | Re-run `fetch` (writes skeleton). |
-| `verify-one <KEY>` returns `detail fetch failed` | Keys are numeric strings (e.g. `9536`), not `SH-...` IDs. |
-
-### Rate limiting / network
-
-| Condition | What to do |
-|---|---|
-| `429 rate-limited` warnings | Helper backs off. If still fails, reduce `--workers`. |
-| `ConnectTimeout` | Check user can reach `https://tmsapi01.ditat.net`. Retry once. |
-| Many 429s + `TokenFetchLimitExceeded` | Stop. Wait for sliding-hour reset. Token cache survives. |
+| `finalize` says `batch sidecar not found` | Re-run `pull`. |
+| `finalize` says `findings file not found` | Re-run `pull` (writes skeleton). |
 
 ### Output
 
@@ -362,7 +352,7 @@ Translate every failure into the next action; never dump errors silently.
 | `finalize` succeeds with `problematic: 0` | "N shipments verified, 0 problematic." Still print docx path (has counts header). |
 | Docx unreadable in Word | Confirm path is absolute. Valid .docx is a zip — try LibreOffice as cross-check. |
 
-**General rule:** every failure ends with one of: (1) "Here is what I'll run next" (auto-recoverable), (2) "Please do X then retry" (needs user input), (3) "Stopping here — Y reason" (hard fail, don't burn budget).
+**General rule:** every failure ends with one of: (1) "Here is what I'll run next" (auto-recoverable), (2) "Please do X then retry" (needs user input), (3) "Stopping here — Y reason" (hard fail).
 
 ## What this skill does NOT do
 

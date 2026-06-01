@@ -15,7 +15,7 @@ into Task Scheduler and it runs on its own forever.
 
 # ------------------------------------------------------------------ User settings
 
-# Where the customer's `.env`, `state.db`, `reports/`, `downloads/` live.
+# Where the customer's `.env`, `reports/`, `downloads/` live.
 # This is the same folder you cd into when running the skill manually.
 $ProjectDir = "$HOME\ditat-verify"
 

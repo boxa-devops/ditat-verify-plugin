@@ -22,29 +22,11 @@ from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.shared import Pt, RGBColor
 
+from .classify import doc_present
+
 
 SEVERITY_ORDER = {"ISSUES": 0, "RC MISSING": 1, "WARN": 2, "OK": 3}
 
-DOC_HINTS = {
-    "RC":  ("rc", "ratecon", "rate-con", "rate_con", "rate confirmation",
-            "ratecnf", "rate con"),
-    "BOL": ("bol", "bill of lading", "bill-of-lading", "bill_of_lading"),
-    "POD": ("pod", "proof of delivery", "delivery-receipt",
-            "delivery_receipt", "proof_of_delivery"),
-}
-
-
-def _doc_present(docs: list[dict], label: str) -> bool:
-    label_low = label.lower()
-    hints = DOC_HINTS[label]
-    for d in docs:
-        cls = (d.get("classification") or "").lower()
-        if cls == label_low:
-            return True
-        name = (d.get("file_name") or "").lower()
-        if any(h in name for h in hints) or any(h in cls for h in hints):
-            return True
-    return False
 SEVERITY_COLOR = {
     "ISSUES":     RGBColor(0xB0, 0x00, 0x20),  # red
     "RC MISSING": RGBColor(0xA0, 0x52, 0x00),  # amber
@@ -187,7 +169,7 @@ def build_batch_docx(
         verdict = diff_result.get("verdict", "RC MISSING")
         counts[verdict] = counts.get(verdict, 0) + 1
         docs = entry.get("documents") or []
-        doc_marks = [f"{lbl}{'✓' if _doc_present(docs, lbl) else '✗'}"
+        doc_marks = [f"{lbl}{'✓' if doc_present(docs, lbl) else '✗'}"
                      for lbl in ("RC", "BOL", "POD")]
         summary_rows.append({
             "shipment_key": key,

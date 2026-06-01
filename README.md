@@ -1,104 +1,104 @@
-# ditat-verify (Claude Code plugin)
+# ditat-verify (Claude Code plugin + cloud server)
 
-Pulls unprocessed shipments from Ditat TMS, downloads BOL/POD/Rate-Confirmation PDFs, cross-checks field values between the documents and the Ditat shipment record, and produces **one Word document** listing only the problematic shipments — ready to forward to ops or the customer.
+Pulls shipments from a Ditat verification **server**, downloads BOL/POD/Rate-Confirmation PDFs, cross-checks field values between the documents and the Ditat shipment record, and produces **one Word document** listing only the problematic shipments — ready to forward to ops or the customer.
 
-The skill collapses the whole pipeline into ~4 sequential tool turns regardless of batch size, so processing a month's worth of shipments takes minutes, not hours.
+The skill collapses the whole pipeline into ~4 sequential tool turns regardless of batch size.
+
+## Architecture — two parts
+
+```
+  server/   (cloud)            scripts/ + skills/  (this plugin, local)
+  ─────────────────            ────────────────────────────────────────
+  holds Ditat credentials      calls the server for a manifest
+  lists shipments              downloads each doc URL
+  classifies documents   ──►   Claude extracts PDF fields
+  streams PDF binaries         diffs against rules.yaml
+                               renders the .docx
+```
+
+- **Server** ([server/](server/)) is deployed to the cloud (Cloud Run / Lambda). It is the only thing that knows the Ditat API credentials. See [server/README.md](server/README.md) for deploy steps.
+- **Plugin** (this repo's root, `scripts/` + `skills/`) runs locally inside Claude Code. It only needs the server's URL (+ an API key). It holds **no Ditat secrets and no state DB** — every run verifies the full window the server returns.
+- **Rules** ([scripts/rules.yaml](scripts/rules.yaml)) externalize every threshold and the accessorial policy, so ops can tune what counts as a problem without touching code.
 
 ---
 
 ## What the customer gets
 
-1. A single `.docx` per run, saved at `<your project>/reports/ditat-verify-<YYYY-MM-DD-HHMM>.docx`. It contains:
-   - A summary table — every shipment in the batch (OK / WARN / ISSUES / RC MISSING) with critical & warning counts and a doc-presence label (RC ✓ · BOL ✓ · POD ✗).
-   - A detail section — **only** the problematic shipments, with route, dates, and the list of mismatched fields.
-2. An updated `state.db` so the same shipments are not re-processed on the next run.
-3. A short summary printed in the chat (verdicts + path to the docx).
+A single `.docx` per run at `<your project>/reports/ditat-verify-<YYYY-MM-DD-HHMM>.docx`:
+- a counts header (OK / WARN / ISSUES / RC MISSING),
+- a detail section for **only** the problematic shipments — route, dates, mismatched fields.
 
-That is it. No per-shipment files, no manual reconciliation.
+Plus a short summary printed in the chat (verdicts + docx path). No per-shipment files, no manual reconciliation.
 
 ---
 
-## Prerequisites (one-time on the customer's machine)
+## Prerequisites
 
 | Requirement | Notes |
 |---|---|
-| **Claude Code** | Desktop app, VS Code extension, or CLI. Any current build. |
-| **Python 3.10+** | `python --version`. Plugin auto-installs its Python deps on first activation. |
-| **A Ditat API user** with credentials (`AccountID`, `ClientID`, `ClientSecret`) | Provisioned by the Ditat admin. The user must have **View** role on Shipment **and** on shipment Documents (sub-permission). Without the Documents role, doc lists come back empty. |
+| **Claude Code** | Desktop app, VS Code extension, or CLI. |
+| **Python 3.10+** | `py --version` (Windows) / `python3 --version`. Plugin auto-installs its deps on first activation. |
+| **A deployed verification server** | See [server/README.md](server/README.md). Whoever deploys it sets the Ditat credentials there. You need its URL + API key. |
+
+The Ditat API user (configured on the **server**, not here) needs **View** role on Shipment **and** on shipment Documents — without the Documents role, doc lists come back empty.
 
 ---
 
-## Installation (customer's first time)
+## Installation (plugin side)
 
-### 1. Add the plugin marketplace and install
-
-In Claude Code, run:
+### 1. Add the marketplace and install
 
 ```
 /plugin marketplace add boxa-devops/ditat-verify-plugin
 /plugin install ditat-verify@ditat-tools
 ```
 
-A `SessionStart` hook will `pip install -r scripts/requirements.txt` automatically on first activation. It only re-installs when `requirements.txt` changes.
+A `SessionStart` hook runs `pip install -r scripts/requirements.txt` automatically (re-installs only when that file changes).
 
-To update later:
+### 2. Point the plugin at your server
 
-```
-/plugin marketplace update ditat-tools
-/plugin update ditat-verify@ditat-tools
-```
-
-### 2. Configure credentials
-
-In whichever folder the customer plans to run the skill from (their "project directory"), create a `.env` file:
+In your project directory, create a `.env`:
 
 PowerShell:
 ```powershell
 Copy-Item "$env:CLAUDE_PLUGIN_ROOT\.env.example" .env
 notepad .env
 ```
-
 Bash:
 ```bash
 cp "$CLAUDE_PLUGIN_ROOT/.env.example" .env
 $EDITOR .env
 ```
 
-Fill in the values issued by the Ditat admin:
-
+Fill in:
 ```
-DITAT_BASE_URL=https://tmsapi01.ditat.net
-DITAT_ACCOUNT_ID=<your account id>
-DITAT_CLIENT_ID=<your client id>
-DITAT_CLIENT_SECRET=<your client secret>
+DITAT_SERVER_URL=https://your-server.example.run.app
+DITAT_SERVER_API_KEY=<the shared key the server expects>
 ```
 
-`.env` should be git-ignored — never commit it.
+`.env` is git-ignored — never commit it.
 
 ### 3. Verify
 
-In a Claude Code session inside that project directory:
-
 ```
-ditat env check
+ditat server check
 ```
 
-Or directly. **On Windows use `py`** (not `python` — Windows ships a Microsoft Store shim that silently fails):
+Or directly. **On Windows use `py`** (not `python` — Windows ships a Store shim that silently fails):
 
 ```powershell
-py "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" check-env
+py "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" check-server
 ```
-
 macOS / Linux:
 ```bash
-python3 "$CLAUDE_PLUGIN_ROOT/scripts/ditat_verify.py" check-env
+python3 "$CLAUDE_PLUGIN_ROOT/scripts/ditat_verify.py" check-server
 ```
 
-Expected: `"ok": true`. If `false`, the `missing` list tells you which env var still has a placeholder value.
+Expected: `"ok": true` and a `health` block from the server.
 
 ### Project directory
 
-The skill stores all per-customer state under whichever folder is `$CLAUDE_PROJECT_DIR` (or the current working directory if unset). First-time customers usually need to create this folder. Pick any directory you control, then:
+All per-run state lives under `$CLAUDE_PROJECT_DIR` (or cwd if unset), never inside the plugin:
 
 PowerShell:
 ```powershell
@@ -106,158 +106,83 @@ New-Item -ItemType Directory -Force "$HOME\ditat-verify" | Out-Null
 Set-Location "$HOME\ditat-verify"
 $env:CLAUDE_PROJECT_DIR = (Get-Location).Path
 ```
-
 Bash:
 ```bash
-mkdir -p "$HOME/ditat-verify"
-cd "$HOME/ditat-verify"
-export CLAUDE_PROJECT_DIR="$PWD"
+mkdir -p "$HOME/ditat-verify"; cd "$HOME/ditat-verify"; export CLAUDE_PROJECT_DIR="$PWD"
 ```
 
-Then place `.env` in that directory. `state.db`, `downloads/`, and `reports/` will be created here on first run.
+Place `.env` here. `downloads/` and `reports/` are created on first run.
 
 ---
 
 ## Daily / weekly use
 
-Just type one of these into Claude Code. The skill handles the rest end-to-end.
+Type one of these into Claude Code:
 
 | User says | What happens |
 |---|---|
-| `verify ditat shipments` | Last 30 days of unprocessed shipments → docx |
-| `verify last week` | Last 7 days |
+| `verify ditat shipments` | Last 30 days → docx |
+| `verify last week` | Last 7 days (filtered on delivery date) |
 | `verify last month` | Last 30 days |
 | `verify last 14 days` | Custom window |
-| `verify next 5 shipments` | First 5 unprocessed in default window |
-| `verify shipment 9536` | Re-process one specific shipment (overrides processed flag) |
-| `ditat verify status` | Last 20 processed shipments + verdict counts |
-| `ditat env check` | Credential preflight |
+| `verify next 5 shipments` | First 5 in default window |
+| `ditat server check` | Server preflight |
 
-The skill prints the docx path at the end. Open it in Word (or Google Docs, LibreOffice — standard `.docx`).
-
-### How long does a run take?
-
-- Downloads + cross-checks: ~1–2 seconds per shipment with default 5-worker parallelism.
-- The single agent turn that reads PDFs in parallel: a few seconds per shipment of PDF content.
-- A typical 50-shipment weekly run: well under 2 minutes.
-
-If the Ditat API is slow or large PDFs need to be downloaded, allow more time. The token cache (12 fetches/hour limit) survives across runs.
-
----
-
-## Scheduling (run it automatically every week)
-
-For ops staff who want the docx waiting in their inbox every Monday morning without ever touching Claude Code manually. Uses **Windows Task Scheduler** — runs locally on the customer's machine, no cloud credentials, no extra services.
-
-### Setup (one-time)
-
-1. Make sure the prerequisites in §Installation are done — plugin installed, `.env` filled, `ditat env check` returns `ok: true`.
-2. Open PowerShell. Navigate to the plugin's scheduling folder:
-   ```powershell
-   cd "$env:CLAUDE_PLUGIN_ROOT\scripts\scheduling"
-   ```
-3. Optionally edit `run-ditat-weekly.ps1` to change the project directory or the prompt (e.g. `verify last month` instead of `verify last week`).
-4. Optionally edit `register-weekly-task.ps1` to change the day/time (default: Monday 09:00).
-5. Run the registrar:
-   ```powershell
-   .\register-weekly-task.ps1
-   ```
-   Output should say `Task registered: DitatVerify-Weekly`.
-
-That's it. Every Monday at 9:00 the task will:
-
-1. Set `$CLAUDE_PROJECT_DIR` to the chosen folder.
-2. Launch Claude Code headless (`claude --print --dangerously-skip-permissions "verify last week"`).
-3. Run the skill end-to-end. The new `.docx` appears in `reports/`.
-4. Append a one-line summary to `<project>\.scheduled-runs.log`.
-
-### Verify it works
-
-Trigger a manual test run:
-
-```powershell
-Start-ScheduledTask -TaskName "DitatVerify-Weekly"
-```
-
-Then check the log:
-
-```powershell
-Get-Content "$HOME\ditat-verify\.scheduled-runs.log" -Tail 10
-```
-
-Expected lines like:
-
-```
-2026-05-26 09:00:14  START prompt='verify last week' project=C:\Users\you\ditat-verify
-2026-05-26 09:01:47  OK docx=C:\Users\you\ditat-verify\reports\ditat-verify-2026-05-26-0901.docx
-```
-
-### Change schedule or remove
-
-To change day/time: edit `register-weekly-task.ps1` then re-run it. The script is idempotent (removes the old task first).
-
-To remove entirely:
-
-```powershell
-.\unregister-weekly-task.ps1
-```
-
-### Limitations
-
-- The task fires only **while the user is logged on** (so Claude Code can launch normally). It will not fire if the laptop is shut down or the user is signed out. To run when logged off, the task would need to store the user's password — not recommended.
-- If the laptop is asleep at 9:00, the task fires when it wakes up (`StartWhenAvailable=true`).
-- The customer must approve the very first `--dangerously-skip-permissions` flag once per session. Inside a scheduled headless run this is automatic.
-
-### Optional: email the docx after each run
-
-Add this block to the bottom of `run-ditat-weekly.ps1` if you want the docx emailed to ops automatically (uses Windows' built-in `Send-MailMessage` — SMTP creds required):
-
-```powershell
-if ($docx -and (Test-Path $docx)) {
-    Send-MailMessage `
-        -From "ops@yourcompany.com" `
-        -To   "ops-team@yourcompany.com" `
-        -Subject "Ditat weekly verification ($(Get-Date -Format 'yyyy-MM-dd'))" `
-        -Body  "Attached: $docx" `
-        -Attachments $docx `
-        -SmtpServer "smtp.yourcompany.com" `
-        -UseSsl
-}
-```
+The skill prints the docx path at the end. Open it in Word / Google Docs / LibreOffice.
 
 ---
 
 ## How the verdicts work
 
-Cross-checks are performed in Python with fixed tolerances — same answer every time.
+Cross-checks run in Python with tolerances from [scripts/rules.yaml](scripts/rules.yaml) — same answer every time, and editable without touching code.
 
 | Field type | Critical (`ISSUES`) | Warning (`WARN`) |
 |---|---|---|
-| Weight | Δ > 5 % | 1–5 % |
+| Weight (Ditat↔RC) | Δ > 5 % | 1–5 % |
+| Weight/pieces (BOL↔RC) | BOL over RC by ≥ 10 % | — |
 | Dates | Δ > 1 day | 0 < Δ ≤ 1 day |
 | Money (rate vs revenue) | Δ > $1.00 or > 1 % | — |
 | BOL / load numbers | Any mismatch | Missing on one side |
 | String fields (commodity, equipment, cities) | — | Mismatch after normalization |
-| RC missing entirely | Verdict = `RC MISSING` (cannot cross-check) | — |
+| Accessorial policy (detention/layover) | RC worse than policy | RC silent on a term |
+| RC missing entirely | `RC MISSING` (or `OK` for allow-listed customers) | — |
 
-Cross-checks performed: **BOL ↔ Rate Confirmation**, **POD ↔ Rate Confirmation**, **Ditat record ↔ Rate Confirmation**, **BOL ↔ POD**.
+Cross-checks: **BOL ↔ RC**, **POD ↔ RC**, **Ditat ↔ RC**, **BOL ↔ POD**, plus an **RC-only accessorial policy** check.
 
-Only shipments with verdict ISSUES, WARN, or RC MISSING appear in the detail section of the docx. OK shipments appear in the summary row only.
+Edit `rules.yaml` to change any threshold, the accessorial defaults, the per-term severities, or the `rc_missing_ok_customers` allow-list. Omitted keys fall back to built-in defaults.
 
 ---
 
 ## Where everything lives
 
-All state is under the customer's project directory (`$CLAUDE_PROJECT_DIR`), never inside the plugin — so plugin updates never wipe operational data.
+All state is under `$CLAUDE_PROJECT_DIR`, never inside the plugin — plugin updates never wipe data.
 
 | Path | Purpose |
 |---|---|
-| `.env` | Ditat credentials (git-ignore) |
-| `.ditat_token_*.json` | Cached OAuth token (respects 12-fetch/hour limit) |
-| `.ditat_batch.json` | Transient handoff between `fetch` and `finalize` (auto-deleted) |
-| `state.db` | SQLite — processed-shipment ledger (key, id, verdict, counts, report path) |
-| `downloads/<key>/` | Original PDFs pulled from Ditat |
+| `.env` | Server URL + API key (git-ignore) |
+| `.ditat_batch.json` | Transient handoff between `pull` and `finalize` |
+| `.ditat_findings.json` | Skeleton from `pull`, filled by the agent via `append-findings` |
+| `downloads/<key>/` | PDFs downloaded from the server |
 | `reports/ditat-verify-*.docx` | The deliverables |
+
+No `state.db` — verification is stateless.
+
+---
+
+## Scheduling (run it automatically every week)
+
+Windows Task Scheduler runs the skill locally, no manual Claude Code session. One-time setup:
+
+1. Plugin installed, `.env` set, `ditat server check` returns `ok: true`.
+2. `cd "$env:CLAUDE_PLUGIN_ROOT\scripts\scheduling"`
+3. Optionally edit `run-ditat-weekly.ps1` (project dir / prompt) and `register-weekly-task.ps1` (day/time, default Monday 09:00).
+4. `.\register-weekly-task.ps1` → `Task registered: DitatVerify-Weekly`.
+
+Every Monday 09:00 it sets `$CLAUDE_PROJECT_DIR`, launches `claude --print --dangerously-skip-permissions "verify last week"`, runs the skill, and appends a line to `<project>\.scheduled-runs.log`.
+
+Test: `Start-ScheduledTask -TaskName "DitatVerify-Weekly"`. Remove: `.\unregister-weekly-task.ps1`.
+
+Limitation: the task fires only while the user is logged on. If asleep at 9:00 it fires on wake (`StartWhenAvailable=true`).
 
 ---
 
@@ -265,57 +190,37 @@ All state is under the customer's project directory (`$CLAUDE_PROJECT_DIR`), nev
 
 | Symptom | Fix |
 |---|---|
-| `check-env` reports `ok: false` | Missing or placeholder values in `.env`. Re-edit and rerun. |
-| Empty document lists, helper logs "Documents View role not granted" | Ask Ditat admin to grant the **Documents View** sub-permission on the API user. |
-| `429` rate-limit errors during a run | The helper backs off automatically. If it persists, wait an hour (token-fetch sliding window) or reduce `--workers`. |
-| `python-docx` import error | First `SessionStart` hook may have failed. Run manually: `pip install -r "$env:CLAUDE_PLUGIN_ROOT\scripts\requirements.txt"`. |
-| OCR-only PDFs unreadable | The skill lists them in `docs_missing`. Re-scan or manually attach a text-based version. |
-| Want to re-process a shipment that was already marked | `verify shipment <KEY>` (overrides the processed flag for that one). |
-| Need to wipe and start over | Delete `state.db` (and optionally `downloads/`, `reports/`). Credentials and token cache survive. |
-
----
-
-## Privilege requirements (Ditat side)
-
-The API user (`DITAT_CLIENT_ID`) needs:
-
-- **View** role on **Shipment**
-- **View** role on shipment **Documents** sub-permission — without it, document lists are empty
-- Standard rate-limit tier (12 token fetches/hour covers ≤4 sweeps/day with the on-disk token cache)
-
-The skill is **read-only against Ditat** by design — it does not write back, send Slack/email, or modify shipment records.
+| `check-server` `ok: false`, `DITAT_SERVER_URL` missing | Set it in `.env`. |
+| `check-server` `health_status: 401` | Set `DITAT_SERVER_API_KEY` to match the server. |
+| `check-server` `health` says `misconfigured` | The server is missing Ditat creds — fix on the server, not here. |
+| `pull` → `server /batch returned 503` | Server can't reach Ditat. Server-side issue. |
+| `python-docx` / `PyYAML` import error | `pip install -r "$env:CLAUDE_PLUGIN_ROOT\scripts\requirements.txt"`. |
+| OCR-only PDFs unreadable | Skill lists them in `docs_missing`. Re-scan or attach a text-based version. |
+| Want different thresholds | Edit `scripts/rules.yaml`. |
 
 ---
 
 ## Sub-commands (advanced / scripting)
 
-The Python helper is fully usable standalone — each sub-command prints JSON on stdout, logs on stderr:
+Each prints JSON on stdout, logs on stderr:
 
 ```
-python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" check-env
-python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" fetch --last-week [--limit 50] [--workers 5]
-python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" verify-one <SHIPMENT_KEY>
-python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" finalize --findings-file .ditat_findings.json
-python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" status
-python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" reset <SHIPMENT_KEY>
-python "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" mark <SHIPMENT_KEY> [--shipment-id ...] [--verdict ...] [--critical N] [--warn N]
+py scripts/ditat_verify.py check-server
+py scripts/ditat_verify.py pull --last-week [--limit 50]
+py scripts/ditat_verify.py append-findings <chunk.json>
+py scripts/ditat_verify.py finalize [--rules-file scripts/rules.yaml] [--full-report]
 ```
 
-`fetch` produces a slim JSON manifest plus a `.ditat_batch.json` sidecar. The Claude skill consumes the manifest, writes a `.ditat_findings.json` with extracted PDF fields, then calls `finalize`. The Python modules `ditat.diff` and `ditat.docx_report` are import-safe if you want to embed the logic in another tool.
+`pull` produces a slim JSON manifest + `.ditat_batch.json` sidecar + `.ditat_findings.json` skeleton. The Claude skill fills the findings via `append-findings`, then calls `finalize`. `ditat.diff` and `ditat.docx_report` are import-safe for embedding.
 
 ---
 
 ## Update / uninstall
 
-Update:
 ```
 /plugin marketplace update ditat-tools
 /plugin update ditat-verify@ditat-tools
-```
-
-Uninstall:
-```
 /plugin uninstall ditat-verify
 ```
 
-State (`state.db`, `reports/`, `downloads/`, `.env`) lives in the customer's project directory and survives plugin updates and uninstalls. Delete those files manually if they should also be removed.
+State (`reports/`, `downloads/`, `.env`) lives in your project directory and survives plugin updates/uninstalls. Delete manually if desired.
