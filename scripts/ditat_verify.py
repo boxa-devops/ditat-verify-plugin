@@ -134,6 +134,54 @@ def _slim_for_stdout(rec: dict) -> dict:
 
 # ---------------------------------------------------------------- commands
 
+def _plugin_root() -> Path:
+    return Path(os.getenv("CLAUDE_PLUGIN_ROOT") or Path(__file__).resolve().parent.parent)
+
+
+def _env_template() -> str:
+    example = _plugin_root() / ".env.example"
+    if example.is_file():
+        return example.read_text(encoding="utf-8")
+    return ("DITAT_SERVER_URL=\n"
+            "DITAT_SERVER_API_KEY=\n")
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """Scaffold a project directory + .env for onboarding a new client."""
+    target = Path(args.path).expanduser()
+    if not target.is_absolute():
+        target = (Path.cwd() / target).resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "reports").mkdir(exist_ok=True)
+
+    env_path = target / ".env"
+    created = False
+    if not env_path.exists():
+        env_path.write_text(_env_template(), encoding="utf-8")
+        created = True
+
+    # Which required vars are still blank/placeholder?
+    text = env_path.read_text(encoding="utf-8")
+    needs = []
+    for var in ("DITAT_SERVER_URL", "DITAT_SERVER_API_KEY"):
+        val = ""
+        for line in text.splitlines():
+            if line.strip().startswith(f"{var}="):
+                val = line.split("=", 1)[1].strip()
+                break
+        if not val or val.startswith(("your_", "https://your-")):
+            needs.append(var)
+
+    print(json.dumps({
+        "project_dir": str(target),
+        "env_path": str(env_path),
+        "env_created": created,
+        "needs_filling": needs,
+        "next": "Fill the needs_filling vars in .env, then run check-server.",
+    }, indent=2))
+    return 0
+
+
 def cmd_check_server(_args: argparse.Namespace) -> int:
     config = ServerConfig()
     ok, missing = config.validate()
@@ -358,6 +406,10 @@ def main() -> int:
     p = argparse.ArgumentParser(description="Ditat shipment verification helper (plugin side)")
     p.add_argument("--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    ini = sub.add_parser("init", help="Scaffold a project dir + .env (onboarding)")
+    ini.add_argument("path", help="Full path to the project directory to create")
+    ini.set_defaults(func=cmd_init)
 
     c = sub.add_parser("check-server", help="Validate server config + ping /health")
     c.set_defaults(func=cmd_check_server)
