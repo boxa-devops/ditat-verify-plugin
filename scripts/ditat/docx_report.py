@@ -20,6 +20,8 @@ from pathlib import Path
 
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor
 
 from .classify import doc_present
@@ -89,11 +91,37 @@ FINDING_SEV_COLOR = {
     "RC MISSING": RGBColor(0xA0, 0x52, 0x00),  # amber
 }
 
-_FINDINGS_COLS = ["Shipment", "Severity", "Pair", "Field", "Value", "vs RC", "Note"]
+_FINDINGS_COLS = ["Severity", "Pair", "Field", "Value", "vs RC", "Note"]
+
+BANNER_FILL = "D9D9D9"  # light gray shading for the per-shipment separator row
 
 
-def _add_findings_table(doc: Document, rows: list[dict]) -> None:
-    """One consolidated table — every finding across the batch is a row."""
+def _shade_cell(cell, fill: str) -> None:
+    """Set a cell's background fill (python-docx has no direct API for this)."""
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:fill"), fill)
+    cell._tc.get_or_add_tcPr().append(shd)
+
+
+def _add_banner_row(table, text: str) -> None:
+    """A shaded full-width row separating one shipment's findings from the next."""
+    cells = table.add_row().cells
+    merged = cells[0]
+    for c in cells[1:]:
+        merged = merged.merge(c)
+    merged.text = text
+    for p in merged.paragraphs:
+        for r in p.runs:
+            r.bold = True
+    _shade_cell(merged, BANNER_FILL)
+
+
+def _add_findings_table(doc: Document, groups: list[dict]) -> None:
+    """One table for the whole batch; each shipment is introduced by a shaded
+    banner row, then its findings rows. Keeps everything in one table while
+    making shipment boundaries obvious.
+    """
     table = doc.add_table(rows=1, cols=len(_FINDINGS_COLS))
     table.alignment = WD_TABLE_ALIGNMENT.LEFT
     table.style = "Light Grid Accent 1"
@@ -104,59 +132,58 @@ def _add_findings_table(doc: Document, rows: list[dict]) -> None:
             for r in p.runs:
                 r.bold = True
 
-    for r in rows:
-        cells = table.add_row().cells
-        cells[0].text = str(r["shipment"])
-        sev_cell = cells[1]
-        sev_cell.text = r["severity"]
-        color = FINDING_SEV_COLOR.get(r["severity"])
-        if color is not None:
-            for p in sev_cell.paragraphs:
-                for run in p.runs:
-                    run.font.color.rgb = color
-                    run.bold = True
-        cells[2].text = str(r["pair"])
-        cells[3].text = str(r["field"])
-        cells[4].text = str(r["value"])
-        cells[5].text = str(r["vs"])
-        cells[6].text = str(r["note"])
+    for g in groups:
+        _add_banner_row(table, f"{g['ship']}  —  {g['verdict']}")
+        for r in g["rows"]:
+            cells = table.add_row().cells
+            sev_cell = cells[0]
+            sev_cell.text = r["severity"]
+            color = FINDING_SEV_COLOR.get(r["severity"])
+            if color is not None:
+                for p in sev_cell.paragraphs:
+                    for run in p.runs:
+                        run.font.color.rgb = color
+                        run.bold = True
+            cells[1].text = str(r["pair"])
+            cells[2].text = str(r["field"])
+            cells[3].text = str(r["value"])
+            cells[4].text = str(r["vs"])
+            cells[5].text = str(r["note"])
 
 
 _SEV_RANK = {"critical": 0, "warn": 1, "info": 2, "RC MISSING": 3}
 
 
-def _findings_rows(problematic_keys, batch, diff_index, findings_index) -> list[dict]:
-    """Flatten every problematic shipment's findings into table rows."""
+def _findings_groups(problematic_keys, batch, diff_index, findings_index) -> list[dict]:
+    """Group findings per shipment: [{ship, verdict, rows:[...]}], sorted by ship."""
     by_key = {e.get("shipment_key"): e for e in batch}
-    rows: list[dict] = []
+    groups: list[dict] = []
     for key in problematic_keys:
         entry = by_key.get(key, {})
         ship = entry.get("shipment_id") or key
         diff_result = diff_index.get(key) or {}
         verdict = diff_result.get("verdict", "RC MISSING")
-        crit = diff_result.get("critical") or []
-        warn = diff_result.get("warn") or []
-        if crit or warn:
-            for f in [*crit, *warn]:
-                rows.append({
-                    "shipment": ship, "severity": f["severity"],
-                    "pair": f["pair"], "field": f["field"],
-                    "value": f["a"], "vs": f["b"], "note": f["message"],
-                })
-        else:
+        rows: list[dict] = []
+        for f in [*(diff_result.get("critical") or []), *(diff_result.get("warn") or [])]:
             rows.append({
-                "shipment": ship, "severity": verdict, "pair": "—", "field": "—",
+                "severity": f["severity"], "pair": f["pair"], "field": f["field"],
+                "value": f["a"], "vs": f["b"], "note": f["message"],
+            })
+        if not rows:
+            rows.append({
+                "severity": verdict, "pair": "—", "field": "—",
                 "value": "", "vs": "", "note": "RC missing — no cross-check",
             })
         missing = (findings_index.get(key) or {}).get("docs_missing") or []
         if missing:
             rows.append({
-                "shipment": ship, "severity": "info", "pair": "docs",
-                "field": "missing", "value": "", "vs": ", ".join(missing),
-                "note": "not provided",
+                "severity": "info", "pair": "docs", "field": "missing",
+                "value": "", "vs": ", ".join(missing), "note": "not provided",
             })
-    rows.sort(key=lambda r: (str(r["shipment"]), _SEV_RANK.get(r["severity"], 9)))
-    return rows
+        rows.sort(key=lambda r: _SEV_RANK.get(r["severity"], 9))
+        groups.append({"ship": ship, "verdict": verdict, "rows": rows})
+    groups.sort(key=lambda g: str(g["ship"]))
+    return groups
 
 
 def build_batch_docx(
@@ -215,8 +242,8 @@ def build_batch_docx(
         if not anomalies_only:
             doc.add_page_break()
         doc.add_heading("Findings", level=1)
-        rows = _findings_rows(problematic_keys, batch, diff_index, findings_index)
-        _add_findings_table(doc, rows)
+        groups = _findings_groups(problematic_keys, batch, diff_index, findings_index)
+        _add_findings_table(doc, groups)
     else:
         doc.add_paragraph("")
         p = doc.add_paragraph()
