@@ -94,7 +94,7 @@ def download_docs(config: ServerConfig, manifest: dict, out_root: Path) -> list[
                 continue
             doc_records.append({
                 "doc_key":        d.get("doc_key"),
-                "file_name":      d.get("file_name"),
+                "file_name":      path.name,
                 "file_type":      d.get("file_type"),
                 "classification": d.get("classification"),
                 "path":           str(path.resolve()),
@@ -109,12 +109,30 @@ def download_docs(config: ServerConfig, manifest: dict, out_root: Path) -> list[
     return records
 
 
+# Ditat filenames often arrive with NO extension (e.g. "UNIT 565042 160112 RC").
+# The Read tool needs a real extension to OCR a PDF as an image — without it the
+# file is treated as text and the agent gets raw PDF bytes. Derive one from the
+# response Content-Type.
+_CT_EXT = {
+    "application/pdf": ".pdf",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/tiff": ".tif",
+}
+
+
+def _ensure_extension(filename: str, content_type: str) -> str:
+    if Path(filename).suffix:
+        return filename
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    return filename + _CT_EXT.get(ct, ".pdf")  # carrier docs are overwhelmingly PDF
+
+
 def _download_one(config: ServerConfig, url: Optional[str], out_dir: Path,
                   file_name: Optional[str], doc_key: Optional[str]) -> Optional[Path]:
     if not url:
         return None
-    filename = file_name or f"document_{doc_key or 'unknown'}.bin"
-    out_path = out_dir / filename
+    base_name = file_name or f"document_{doc_key or 'unknown'}"
     for attempt in range(1, _DOWNLOAD_RETRIES + 1):
         try:
             resp = requests.get(url, headers=config._headers(), stream=True, timeout=120)
@@ -125,6 +143,7 @@ def _download_one(config: ServerConfig, url: Optional[str], out_dir: Path,
             log.warning("doc download HTTP %s for %s", resp.status_code, url)
             resp.close()
             return None
+        out_path = out_dir / _ensure_extension(base_name, resp.headers.get("Content-Type", ""))
         out_dir.mkdir(parents=True, exist_ok=True)
         total = 0
         try:
