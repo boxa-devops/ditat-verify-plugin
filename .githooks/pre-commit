@@ -1,0 +1,20 @@
+#!/bin/sh
+# Auto-bump plugin patch version on every commit so /plugin update detects new code.
+# Enable once per clone:  git config core.hooksPath .githooks
+
+# Pick an interpreter that actually RUNS — Windows Store stubs answer
+# `command -v python` but fail on exec, so verify with a real invocation.
+# `py` first (real Windows launcher), then python3 (linux/mac), then python.
+PY=""
+for c in py python3 python; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c "import sys" >/dev/null 2>&1; then
+    PY="$c"; break
+  fi
+done
+
+if [ -z "$PY" ]; then
+  echo "pre-commit: no python interpreter found — skipping version bump" >&2
+  exit 0
+fi
+
+"$PY" "$(git rev-parse --show-toplevel)/.githooks/bump_version.py" || exit 1
