@@ -49,12 +49,19 @@ _RC = {
 
 class TestRulesAffectDiff(unittest.TestCase):
 
-    def test_custom_detention_rate_threshold(self):
-        # Raise the required detention rate to $75; the RC's $50 is now too low.
-        rules = _deep_merge(DEFAULTS, {"accessorial": {"detention_rate": 75.0}})
-        r = diff.run_diff(_DITAT, {"rc": _RC}, rules)
-        self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "detention_rate"
-                            for f in r["critical"]))
+    def test_custom_free_hours_changes_detention_detection(self):
+        # RC silent on detention; POD shows a 4h wait. With default free=2h it's
+        # detention (critical); raise free to 5h and the same 4h wait is within
+        # free time → no finding. Proves the rule drives detection.
+        rc = {k: v for k, v in _RC.items() if not k.startswith("detention_")}
+        pod = {"arrival_time": "08:00", "departure_time": "12:00"}  # 4h
+        crit = diff.run_diff(_DITAT, {"rc": rc, "pod": pod})  # default free=2
+        self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "detention"
+                            for f in crit["critical"]))
+        lax = _deep_merge(DEFAULTS, {"accessorial": {"detention_free_hrs": 5.0}})
+        r = diff.run_diff(_DITAT, {"rc": rc, "pod": pod}, lax)
+        self.assertFalse(any(f["pair"] == "RC-policy" and f["field"] == "detention"
+                             for f in r["critical"] + r["warn"]))
 
     def test_custom_ok_customer_list(self):
         ditat = dict(_DITAT, customer="Walmart Inc")

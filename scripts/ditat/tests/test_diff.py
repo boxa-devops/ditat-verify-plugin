@@ -177,37 +177,51 @@ class TestVerdicts(unittest.TestCase):
                              ("weight_received", "pieces_received")
                              for f in r["critical"] + r["warn"] + r["info"]))
 
-    def test_rc_policy_default_terms_pass(self):
+    # --- RC-policy: RC terms govern; default only flags silent + POD-detected occurrence ---
+
+    def test_rc_states_terms_no_pod_wait_is_silent(self):
+        # RC has terms, POD has no in/out → nothing to detect → no RC-policy finding.
         r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=_BOL_OK, pod=_POD_OK))
         self.assertFalse(any(f["pair"] == "RC-policy"
                              for f in r["critical"] + r["warn"]))
 
-    def test_rc_detention_rate_below_default_is_critical(self):
-        rc = dict(_RC_OK, detention_rate=35.0)  # 26/05 chat example
-        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=_POD_OK))
-        self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "detention_rate"
+    def test_rc_states_low_detention_is_accepted_not_flagged(self):
+        # RC states $25/hr (below old floor) AND detention occurred (4h wait).
+        # RC governs → accepted, NOT flagged.
+        rc = dict(_RC_OK, detention_rate=25.0)
+        pod = dict(_POD_OK, arrival_time="08:00", departure_time="12:00")  # 4h
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=pod))
+        self.assertFalse(any(f["pair"] == "RC-policy" and f["field"] == "detention"
+                             for f in r["critical"] + r["warn"]))
+
+    def test_rc_silent_detention_but_occurred_is_critical(self):
+        rc = {k: v for k, v in _RC_OK.items() if not k.startswith("detention_")}
+        pod = dict(_POD_OK, arrival_time="08:00", departure_time="12:00")  # 4h > 2 free
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=pod))
+        self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "detention"
                             for f in r["critical"]))
 
-    def test_rc_detention_free_hrs_over_default_is_critical(self):
-        rc = dict(_RC_OK, detention_free_hrs=4)
-        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=_POD_OK))
-        self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "detention_free_hrs"
+    def test_short_wait_does_not_trigger_detention(self):
+        rc = {k: v for k, v in _RC_OK.items() if not k.startswith("detention_")}
+        pod = dict(_POD_OK, arrival_time="08:00", departure_time="09:00")  # 1h < 2 free
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=pod))
+        self.assertFalse(any(f["pair"] == "RC-policy"
+                             for f in r["critical"] + r["warn"]))
+
+    def test_rc_silent_layover_but_long_wait_is_critical(self):
+        rc = {k: v for k, v in _RC_OK.items() if not k.startswith("layover_")}
+        pod = dict(_POD_OK, arrival_time="08:00", departure_time="14:00")  # 6h ≥ 5 thr
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=pod))
+        self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "layover"
                             for f in r["critical"]))
 
-    def test_rc_missing_policy_terms_are_warn(self):
-        rc = {k: v for k, v in _RC_OK.items() if not k.startswith(("detention_", "layover_"))}
-        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=_POD_OK))
-        warn_fields = {f["field"] for f in r["warn"] if f["pair"] == "RC-policy"}
-        self.assertEqual(warn_fields, {
-            "detention_rate", "detention_free_hrs", "detention_max_hrs",
-            "layover_rate", "layover_threshold_hrs",
-        })
-
-    def test_rc_layover_threshold_over_default_is_warn(self):
-        rc = dict(_RC_OK, layover_threshold_hrs=8)
-        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=_POD_OK))
-        self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "layover_threshold_hrs"
-                            for f in r["warn"]))
+    def test_pod_in_out_crossing_midnight(self):
+        # out before in → crossed midnight → 23:00→02:00 = 3h wait.
+        rc = {k: v for k, v in _RC_OK.items() if not k.startswith("detention_")}
+        pod = dict(_POD_OK, arrival_time="23:00", departure_time="02:00")  # 3h > 2 free
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=pod))
+        self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "detention"
+                            for f in r["critical"]))
 
     def test_damages_emits_warning(self):
         pod = dict(_POD_OK, damages_notes="1 pallet damaged")

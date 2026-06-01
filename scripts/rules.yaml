@@ -26,20 +26,19 @@ date:
 # String fields (commodity, locations, equipment) when they mismatch.
 string_mismatch_severity: warn
 
-# Accessorial policy — company defaults the RC must honor. Terms worse than
-# these mean we'd be undercompensated.
+# Accessorial policy. The RC GOVERNS: when the RC states detention/layover
+# terms, they're the agreed contract and are NOT flagged. The defaults below are
+# only the fallback used to DETECT an unbilled accessorial — when the RC is
+# silent AND the POD's in/out times show the wait occurred → critical.
 accessorial:
-  detention_rate: 50.0          # $/hr — RC below this is bad
-  detention_free_hrs: 2.0       # free hrs — RC above this is bad
-  detention_max_hrs: 5.0        # billable cap — RC below this is bad
-  layover_rate: 250.0           # $/24h — RC below this is bad
-  layover_threshold_hrs: 5.0    # wait before layover — RC above this is bad
-  severities:
-    detention_rate: critical
-    detention_free_hrs: critical
-    detention_max_hrs: warn
-    layover_rate: critical
-    layover_threshold_hrs: warn
+  # ACTIVE — detection thresholds against the POD in/out wait:
+  detention_free_hrs: 2.0       # wait beyond this (RC silent) → detention critical
+  layover_threshold_hrs: 5.0    # wait at/beyond this (RC silent) → layover critical
+  # Reference only — retained for reporting/future use; not used for flagging
+  # now that the RC's own terms govern:
+  detention_rate: 50.0          # $/hr company floor
+  detention_max_hrs: 5.0        # billable cap
+  layover_rate: 250.0           # $/24h company floor
 
 # Customers for whom a missing RC is acceptable (verdict OK, not RC MISSING).
 # Matched as a case-insensitive substring of the Ditat customer name.

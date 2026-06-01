@@ -153,7 +153,8 @@ Chunk file schema (list form):
                "commodity": "..." },
       "pod": { "bol_number": "...", "delivery_date": "...", "signed_by": "...",
                "pieces_received": 24, "weight_received_lbs": 41950,
-               "damages_notes": null }
+               "damages_notes": null,
+               "arrival_time": "08:00", "departure_time": "12:30" }
     },
     "docs_missing": []
   }
@@ -172,8 +173,8 @@ The helper merges atomically (last-write-wins per shipment_key). The skeleton's 
 | delivery_date                   | pickup_date                    | pieces_received      |
 | equipment_type                  | delivery_date                  | weight_received_lbs  |
 | pickup_location {city, state}   | weight_lbs                     | damages_notes        |
-| delivery_location {city, state} | pieces                         |                      |
-| commodity                       | commodity, po_numbers, hazmat  |                      |
+| delivery_location {city, state} | pieces                         | **arrival_time**     |
+| commodity                       | commodity, po_numbers, hazmat  | **departure_time**   |
 | weight_lbs, pieces              |                                |                      |
 | detention_rate ($/hr)           |                                |                      |
 | detention_free_hrs              |                                |                      |
@@ -181,13 +182,17 @@ The helper merges atomically (last-write-wins per shipment_key). The skeleton's 
 | layover_rate ($/24h)            |                                |                      |
 | layover_threshold_hrs           |                                |                      |
 
-**RC accessorial extraction notes:**
+**POD in/out times (drive accessorial detection):**
+- `arrival_time` / `departure_time` — the in/out (check-in / check-out) times stamped on the delivery receipt. Accept `HH:MM`, `H:MM AM/PM`, or full ISO datetime. Omit if the POD doesn't show them.
+- The diff computes wait = departure − arrival. If wait exceeds the default free hours and the **RC is silent** on detention, that's flagged (see RC-policy rules). Without these times, no accessorial occurrence can be detected.
+
+**RC accessorial extraction notes (the RC governs):**
 - `detention_rate` — dollars per hour the carrier is paid for detention.
 - `detention_free_hrs` — free hours before detention starts (typical RC phrasing: "after N free hours").
-- `detention_max_hrs` — cap on detention hours (some RCs cap; omit if RC says no cap).
+- `detention_max_hrs` — cap on detention hours (omit if RC says no cap).
 - `layover_rate` — dollars per 24-hour layover period.
-- `layover_threshold_hrs` — hours of waiting before layover triggers (typical phrasing: "after X hours").
-- If RC is silent on a term, omit the key — the diff layer will flag it as `WARN` ("RC silent on policy term").
+- `layover_threshold_hrs` — hours of waiting before layover triggers.
+- Extract whatever terms the RC states — **when the RC states a detention/layover term it is the agreed contract and is NOT flagged**, even if below company defaults. If the RC is silent on a term, omit the key; it's only a problem when the POD shows the accessorial actually occurred.
 
 Rules:
 - **Do NOT diff in your head.** `finalize` runs the deterministic diff in Python. Just extract cleanly.
@@ -213,11 +218,8 @@ The helper:
 
 | Pair          | Field                          | Rule (default)                                                         |
 |---------------|--------------------------------|------------------------------------------------------------------------|
-| RC-policy     | detention_rate                 | RC < $50/hr → critical; missing → warn                                 |
-| RC-policy     | detention_free_hrs             | RC > 2 hrs → critical; missing → warn                                  |
-| RC-policy     | detention_max_hrs              | RC < 5 hrs → warn; missing → warn                                      |
-| RC-policy     | layover_rate                   | RC < $250/24h → critical; missing → warn                               |
-| RC-policy     | layover_threshold_hrs          | RC > 5 hrs → warn; missing → warn                                      |
+| RC-policy     | detention                      | RC states detention terms → accepted (no flag). RC silent **and** POD in/out wait > 2h free → critical |
+| RC-policy     | layover                        | RC states layover terms → accepted (no flag). RC silent **and** POD in/out wait ≥ 5h → critical |
 | BOL↔RC        | weight_lbs                     | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |
 | BOL↔RC        | pieces                         | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |
 | BOL↔RC        | bol_number                     | id mismatch → critical                                                 |

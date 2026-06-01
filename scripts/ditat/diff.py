@@ -379,65 +379,86 @@ def diff_ditat_rc(ditat: Optional[dict], rc: Optional[dict], rules: dict) -> lis
     return out
 
 
-def diff_rc_policy(rc: Optional[dict], rules: dict) -> list[dict]:
-    """RC-only check: does the rate confirmation honor our accessorial policy?
+def _clock_hours(v: Any) -> Optional[float]:
+    """Hours-since-midnight for a time/datetime value. Accepts ISO datetimes,
+    'HH:MM', and 'H:MM AM/PM'. Returns None if unparseable.
+    """
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.hour + v.minute / 60.0
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.hour + dt.minute / 60.0
+    except (ValueError, TypeError):
+        pass
+    m = re.search(r"(\d{1,2}):(\d{2})\s*([ap]\.?m\.?)?", s, re.I)
+    if not m:
+        return None
+    h, mn = int(m.group(1)), int(m.group(2))
+    ap = (m.group(3) or "").lower().replace(".", "")
+    if ap == "pm" and h != 12:
+        h += 12
+    elif ap == "am" and h == 12:
+        h = 0
+    if h > 23 or mn > 59:
+        return None
+    return h + mn / 60.0
 
-    Missing terms → warn (RC should spell them out). Worse-than-default terms →
-    critical/warn per the configured severities (we'd be undercompensated).
+
+def _pod_wait_hours(pod: Optional[dict]) -> Optional[float]:
+    """Wait duration (hours) from the POD's in/out times. None if unavailable."""
+    tin = _clock_hours(_doc_get(pod, "arrival_time", "in_time", "arrived_at", "time_in"))
+    tout = _clock_hours(_doc_get(pod, "departure_time", "out_time", "departed_at", "time_out"))
+    if tin is None or tout is None:
+        return None
+    wait = tout - tin
+    if wait < 0:  # crossed midnight
+        wait += 24.0
+    return wait
+
+
+def diff_rc_policy(rc: Optional[dict], pod: Optional[dict], rules: dict) -> list[dict]:
+    """Accessorial policy check — the RC governs.
+
+    When the RC states detention/layover terms, those are the agreed contract;
+    we do NOT flag them (the company default is dropped). The default only acts
+    as a fallback: when the RC is SILENT on an accessorial but the POD's in/out
+    times show it actually occurred, we performed an accessorial with no
+    contractual basis to bill → critical.
     """
     out: list[dict] = []
     if not rc:
         return out
     pair = "RC-policy"
     pol = rules["accessorial"]
-    sev = pol["severities"]
 
-    det_rate = _to_float(_doc_get(rc, "detention_rate"))
-    det_free = _to_float(_doc_get(rc, "detention_free_hrs", "detention_free_hours"))
-    det_max  = _to_float(_doc_get(rc, "detention_max_hrs", "detention_max_hours"))
-    lay_rate = _to_float(_doc_get(rc, "layover_rate"))
-    lay_thr  = _to_float(_doc_get(rc, "layover_threshold_hrs", "layover_threshold_hours"))
+    wait = _pod_wait_hours(pod)
+    if wait is None:
+        return out  # no in/out times → can't detect occurrence, nothing to flag
 
-    def _missing(field: str, label: str) -> None:
+    has_detention = _to_float(_doc_get(rc, "detention_rate")) is not None
+    has_layover = _to_float(_doc_get(rc, "layover_rate")) is not None
+    free = pol["detention_free_hrs"]
+    lay_thr = pol["layover_threshold_hrs"]
+
+    if wait > free and not has_detention:
         out.append({
-            "pair": pair, "field": field,
-            "a": "(missing)", "b": label,
-            "severity": WARN, "message": "RC silent on policy term",
+            "pair": pair, "field": "detention",
+            "a": f"{wait:.1f}h wait", "b": f"> {free:g}h free (default)",
+            "severity": CRIT,
+            "message": "detention occurred but RC silent on detention terms",
         })
-
-    def _worse(field: str, actual: float, default: float, unit: str) -> None:
+    if wait >= lay_thr and not has_layover:
         out.append({
-            "pair": pair, "field": field,
-            "a": f"{actual:g} {unit}", "b": f"{default:g} {unit} (default)",
-            "severity": sev[field], "message": "RC term worse than company default",
+            "pair": pair, "field": "layover",
+            "a": f"{wait:.1f}h wait", "b": f"≥ {lay_thr:g}h (default)",
+            "severity": CRIT,
+            "message": "layover occurred but RC silent on layover terms",
         })
-
-    # (value, "lower"|"higher" is-worse direction, default, unit, missing-label)
-    if det_rate is None:
-        _missing("detention_rate", f"≥ ${pol['detention_rate']:g}/hr")
-    elif det_rate < pol["detention_rate"]:
-        _worse("detention_rate", det_rate, pol["detention_rate"], "$/hr")
-
-    if det_free is None:
-        _missing("detention_free_hrs", f"≤ {pol['detention_free_hrs']:g} hrs")
-    elif det_free > pol["detention_free_hrs"]:
-        _worse("detention_free_hrs", det_free, pol["detention_free_hrs"], "hrs")
-
-    if det_max is None:
-        _missing("detention_max_hrs", f"≥ {pol['detention_max_hrs']:g} hrs")
-    elif det_max < pol["detention_max_hrs"]:
-        _worse("detention_max_hrs", det_max, pol["detention_max_hrs"], "hrs")
-
-    if lay_rate is None:
-        _missing("layover_rate", f"≥ ${pol['layover_rate']:g}/24h")
-    elif lay_rate < pol["layover_rate"]:
-        _worse("layover_rate", lay_rate, pol["layover_rate"], "$/24h")
-
-    if lay_thr is None:
-        _missing("layover_threshold_hrs", f"≤ {pol['layover_threshold_hrs']:g} hrs")
-    elif lay_thr > pol["layover_threshold_hrs"]:
-        _worse("layover_threshold_hrs", lay_thr, pol["layover_threshold_hrs"], "hrs")
-
     return out
 
 
@@ -469,7 +490,7 @@ def run_diff(ditat: dict, extracted: dict, rules: Optional[dict] = None) -> dict
     pod = extracted.get("pod") if isinstance(extracted, dict) else None
 
     findings: list[dict] = []
-    findings.extend(diff_rc_policy(rc, rules))
+    findings.extend(diff_rc_policy(rc, pod, rules))
     findings.extend(diff_bol_rc(bol, rc, rules))
     findings.extend(diff_pod_rc(pod, rc, rules, bol))
     findings.extend(diff_ditat_rc(ditat, rc, rules))
