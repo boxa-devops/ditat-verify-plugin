@@ -129,6 +129,25 @@ class TestVerdicts(unittest.TestCase):
                             for f in r["critical"]))
 
 
+    def test_ditat_zero_weight_pieces_is_warn_not_critical(self):
+        # Tenant never enters weight/pieces in Ditat → 0. RC has real values.
+        # Should be WARN ("Ditat not entered"), not a critical discrepancy.
+        ditat = dict(_DITAT_OK, total_weight_lbs=0, total_pieces=0)
+        r = diff.run_diff(ditat, _shipment(rc=_RC_OK, bol=_BOL_OK, pod=_POD_OK))
+        self.assertFalse(any(f["pair"] == "Ditat↔RC" and f["field"] in
+                             ("total_weight_lbs", "total_pieces")
+                             for f in r["critical"]))
+        warn_fields = {f["field"] for f in r["warn"] if f["pair"] == "Ditat↔RC"}
+        self.assertIn("total_weight_lbs", warn_fields)
+        self.assertIn("total_pieces", warn_fields)
+
+    def test_ditat_real_weight_still_compares(self):
+        # When Ditat DOES carry weight, a big gap is still critical.
+        ditat = dict(_DITAT_OK, total_weight_lbs=20000)  # RC=40000 → 50% off
+        r = diff.run_diff(ditat, _shipment(rc=_RC_OK, bol=_BOL_OK, pod=_POD_OK))
+        self.assertTrue(any(f["pair"] == "Ditat↔RC" and f["field"] == "total_weight_lbs"
+                            for f in r["critical"]))
+
     def test_amazon_rc_missing_is_ok(self):
         ditat = dict(_DITAT_OK, customer="Amazon Logistics LLC")
         r = diff.run_diff(ditat, _shipment(bol=_BOL_OK, pod=_POD_OK))

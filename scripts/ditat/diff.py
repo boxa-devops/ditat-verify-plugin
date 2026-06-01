@@ -220,6 +220,19 @@ def _cmp_str(a: Any, b: Any, severity_on_diff: str = WARN) -> tuple[str, str] | 
     return (severity_on_diff, "mismatch")
 
 
+def _cmp_ditat_qty(a: Any, b: Any, inner) -> tuple[str, str] | None:
+    """Ditat↔RC weight/pieces: some tenants never enter these in Ditat, so a
+    Ditat 0/None isn't a real discrepancy — it's a not-entered field. Downgrade
+    to WARN when Ditat is empty but the RC has a value; otherwise defer to `inner`.
+    """
+    fa = _to_float(a)
+    if fa is None or fa == 0:
+        if _to_float(b) is None:
+            return None
+        return (WARN, "Ditat not entered")
+    return inner(a, b)
+
+
 def _cmp_id(a: Any, b: Any) -> tuple[str, str] | None:
     """Identifier compare: any diff is critical."""
     na, nb = _norm_str(a), _norm_str(b)
@@ -348,9 +361,11 @@ def diff_ditat_rc(ditat: Optional[dict], rc: Optional[dict], rules: dict) -> lis
     _emit(out, pair, "load_number",
           ditat.get("load_number"), _doc_get(rc, "load_number"), _cmp_id)
     _emit(out, pair, "total_weight_lbs",
-          ditat.get("total_weight_lbs"), _doc_get(rc, "weight_lbs", "weight"), cmp_weight)
+          ditat.get("total_weight_lbs"), _doc_get(rc, "weight_lbs", "weight"),
+          partial(_cmp_ditat_qty, inner=cmp_weight))
     _emit(out, pair, "total_pieces",
-          ditat.get("total_pieces"), _doc_get(rc, "pieces"), _cmp_int)
+          ditat.get("total_pieces"), _doc_get(rc, "pieces"),
+          partial(_cmp_ditat_qty, inner=_cmp_int))
     _emit(out, pair, "equipment_type",
           ditat.get("equipment_type"), _doc_get(rc, "equipment_type"), cmp_str)
     _emit(out, pair, "pickup_location",
