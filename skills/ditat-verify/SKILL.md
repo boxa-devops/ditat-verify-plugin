@@ -67,7 +67,8 @@ py "$env:CLAUDE_PLUGIN_ROOT\scripts\ditat_verify.py" fetch --last-month
 ```
 
 Flags:
-- `--last-week` / `--last-month` — presets (7 / 30 days)
+- `--last-week` / `--last-month` — presets (7 / 30 days). `--last-week` filters on **delivery date** (delivered last week), not `updatedOn`.
+- `--filter-column COL` — Ditat lookup column for the window (default `updatedOn`; `--last-week` defaults to delivery date). Override if Ditat rejects the name.
 - `--since-days N` — custom window
 - `--limit N` — cap (default 500)
 - `--all` — no date filter

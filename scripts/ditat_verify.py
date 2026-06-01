@@ -66,6 +66,10 @@ FINDINGS_FILE = _state_root() / ".ditat_findings.json"
 
 MAX_FINDINGS_BYTES = 50 * 1024 * 1024  # 50 MB defensive cap
 
+# Ditat shipment-lookup column for delivery date. Exact name unconfirmed —
+# override via --filter-column if the API rejects it.
+DELIVERY_DATE_COLUMN = "deliveryDate"
+
 
 # ---------------------------------------------------------------- findings skeleton
 
@@ -243,10 +247,18 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         args.since_days = 7
     elif args.last_month:
         args.since_days = 30
+
+    # --last-week means "delivered last week" → filter on delivery date, not
+    # updatedOn. Explicit --filter-column always wins.
+    if args.filter_column is None:
+        filter_column = DELIVERY_DATE_COLUMN if args.last_week else "updatedOn"
+    else:
+        filter_column = args.filter_column
+
     since = None if args.all else datetime.now(timezone.utc) - timedelta(days=args.since_days)
     shipments = shipment_svc.list_shipments(
         since=since,
-        filter_column=args.filter_column,
+        filter_column=filter_column,
         page_size=args.page_size,
     )
 
@@ -536,7 +548,10 @@ def main() -> int:
     f.add_argument("--last-week", action="store_true")
     f.add_argument("--last-month", action="store_true")
     f.add_argument("--all", action="store_true")
-    f.add_argument("--filter-column", default="updatedOn")
+    f.add_argument("--filter-column", default=None,
+                   help="Ditat lookup column for the time window. Default: "
+                        "'updatedOn'; --last-week defaults to delivery date "
+                        f"('{DELIVERY_DATE_COLUMN}'). Override if Ditat rejects the name.")
     f.add_argument("--include-processed", action="store_true")
     f.add_argument("--require-docs", action="store_true", default=True)
     f.add_argument("--workers", type=int, default=5)
