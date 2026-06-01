@@ -203,12 +203,6 @@ def _findings_groups(problematic_keys, batch, diff_index, findings_index) -> lis
                 "severity": verdict, "pair": "—", "field": "—",
                 "value": "", "vs": "", "note": "RC missing — no cross-check",
             })
-        missing = (findings_index.get(key) or {}).get("docs_missing") or []
-        if missing:
-            rows.append({
-                "severity": "info", "pair": "docs", "field": "missing",
-                "value": "", "vs": ", ".join(missing), "note": "not provided",
-            })
         rows.sort(key=lambda r: _SEV_RANK.get(r["severity"], 9))
         banner = _banner_text(ship, verdict, len(crit), len(warn),
                               entry.get("ditat_fields") or {})

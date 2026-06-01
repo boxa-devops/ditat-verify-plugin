@@ -249,9 +249,20 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         return 1
 
     rules = rules_mod.load_rules(args.rules_file)
+    as_of = datetime.now(timezone.utc).date()
 
-    batch_records: list[dict] = batch_doc.get("shipments") or []
+    all_records: list[dict] = batch_doc.get("shipments") or []
     findings_list: list[dict] = findings_doc.get("shipments") or []
+
+    # We only verify DELIVERED shipments. Drop any whose delivery date is still
+    # in the future — they're not done and their docs aren't due yet.
+    batch_records: list[dict] = []
+    skipped_pending = 0
+    for entry in all_records:
+        if diff_mod.is_pending(entry.get("ditat_fields") or {}, as_of):
+            skipped_pending += 1
+            continue
+        batch_records.append(entry)
 
     findings_index: dict[str, dict] = {}
     for f in findings_list:
@@ -267,7 +278,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         key = str(entry.get("shipment_key") or "")
         ditat = entry.get("ditat_fields") or {}
         extracted = findings_index.get(key) or {}
-        diff_index[key] = diff_mod.run_diff(ditat, extracted, rules)
+        diff_index[key] = diff_mod.run_diff(ditat, extracted, rules, as_of)
 
     if args.output:
         out_path = Path(args.output)
@@ -298,6 +309,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     print(json.dumps({
         "docx": str(out_path.resolve()),
         "processed": counters["shipments"],
+        "skipped_pending": skipped_pending,
         "problematic": counters["problematic"],
         "verdicts": counters["verdicts"],
         "problem_shipments": problem_rows,

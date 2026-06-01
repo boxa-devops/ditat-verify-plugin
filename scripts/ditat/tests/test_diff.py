@@ -229,6 +229,65 @@ class TestVerdicts(unittest.TestCase):
         self.assertTrue(any(f["field"] == "damages_notes" for f in r["warn"]))
 
 
+from datetime import date  # noqa: E402
+
+_AS_OF = date(2026, 6, 10)
+
+
+def _delivered(deliv="2026-06-05", **kw):
+    """Ditat record with a delivery appointment date (default in the past)."""
+    d = dict(_DITAT_OK, **kw)
+    d["delivery"] = {"city": "Atlanta", "state": "GA",
+                     "appointment_to": f"{deliv}T10:00:00.000Z"}
+    return d
+
+
+class TestDeliveryAndCompleteness(unittest.TestCase):
+
+    def test_is_pending_future_delivery(self):
+        self.assertTrue(diff.is_pending(_delivered("2026-06-20"), _AS_OF))
+        self.assertFalse(diff.is_pending(_delivered("2026-06-01"), _AS_OF))
+        # No delivery date → unknown → not treated as pending.
+        self.assertFalse(diff.is_pending(_DITAT_OK, _AS_OF))
+
+    def test_delivered_missing_bol_is_critical(self):
+        ext = {"rc": _RC_OK, "pod": _POD_OK, "docs_missing": ["BOL"]}
+        r = diff.run_diff(_delivered(), ext, as_of=_AS_OF)
+        self.assertEqual(r["verdict"], "ISSUES")
+        self.assertTrue(any(f["pair"] == "Docs" and f["field"] == "BOL"
+                            for f in r["critical"]))
+
+    def test_delivered_missing_pod_is_critical(self):
+        ext = {"rc": _RC_OK, "bol": _BOL_OK, "docs_missing": ["POD"]}
+        r = diff.run_diff(_delivered(), ext, as_of=_AS_OF)
+        self.assertTrue(any(f["pair"] == "Docs" and f["field"] == "POD"
+                            for f in r["critical"]))
+
+    def test_delivered_missing_rc_is_critical(self):
+        ext = {"bol": _BOL_OK, "pod": _POD_OK, "docs_missing": ["RC"]}
+        r = diff.run_diff(_delivered(customer="Walmart"), ext, as_of=_AS_OF)
+        self.assertEqual(r["verdict"], "ISSUES")
+        self.assertTrue(any(f["pair"] == "Docs" and f["field"] == "RC"
+                            for f in r["critical"]))
+
+    def test_delivered_missing_rc_amazon_exempt(self):
+        ext = {"bol": _BOL_OK, "pod": _POD_OK, "docs_missing": ["RC"]}
+        r = diff.run_diff(_delivered(customer="Amazon Logistics"), ext, as_of=_AS_OF)
+        self.assertFalse(any(f["pair"] == "Docs" and f["field"] == "RC"
+                             for f in r["critical"]))
+
+    def test_pending_shipment_docs_not_required(self):
+        # Future delivery → completeness must NOT fire even with missing docs.
+        ext = {"rc": _RC_OK, "docs_missing": ["BOL", "POD"]}
+        r = diff.run_diff(_delivered("2026-06-20"), ext, as_of=_AS_OF)
+        self.assertFalse(any(f["pair"] == "Docs" for f in r["critical"]))
+
+    def test_no_as_of_skips_completeness(self):
+        ext = {"rc": _RC_OK, "docs_missing": ["BOL", "POD"]}
+        r = diff.run_diff(_delivered(), ext)  # as_of omitted
+        self.assertFalse(any(f["pair"] == "Docs" for f in r["critical"]))
+
+
 class TestComparators(unittest.TestCase):
 
     def test_weight_comparator_returns_none_when_both_absent(self):

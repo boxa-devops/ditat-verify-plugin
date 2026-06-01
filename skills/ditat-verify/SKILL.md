@@ -114,7 +114,9 @@ Stdout JSON:
 }
 ```
 
-If `count == 0`: tell user "no shipments in this window" and stop. **Do not call `finalize`.**
+**Only DELIVERED shipments are returned.** The server excludes any load whose delivery date is still in the future (not done yet — its docs aren't due). `finalize` also drops pending defensively and reports `skipped_pending`.
+
+If `count == 0`: tell user "no delivered shipments in this window" and stop. **Do not call `finalize`.**
 
 ### Step 3 — Read PDFs + extract (big parallel chunks, one merge per chunk)
 
@@ -218,6 +220,7 @@ The helper:
 
 | Pair          | Field                          | Rule (default)                                                         |
 |---------------|--------------------------------|------------------------------------------------------------------------|
+| Docs          | RC / BOL / POD                 | **delivered** shipment missing any of RC/BOL/POD → critical (RC exempt for `rc_missing_ok_customers`). Pending loads excluded upstream. |
 | RC-policy     | detention                      | RC states detention terms → accepted (no flag). RC silent **and** POD in/out wait > 2h free → critical |
 | RC-policy     | layover                        | RC states layover terms → accepted (no flag). RC silent **and** POD in/out wait ≥ 5h → critical |
 | BOL↔RC        | weight_lbs                     | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |

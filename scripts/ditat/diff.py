@@ -475,13 +475,69 @@ def diff_bol_pod(bol: Optional[dict], pod: Optional[dict]) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------- delivery status
+
+def delivery_date(ditat: Optional[dict]) -> Optional[date]:
+    """Scheduled delivery date from the Ditat record (appointment end → start → date)."""
+    if not isinstance(ditat, dict):
+        return None
+    d = ditat.get("delivery") or {}
+    return _to_date(d.get("appointment_to") or d.get("appointment_from") or d.get("date"))
+
+
+def is_pending(ditat: Optional[dict], as_of: Optional[date]) -> bool:
+    """True when the delivery date is known and still in the future (not delivered)."""
+    if as_of is None:
+        return False
+    d = delivery_date(ditat)
+    return d is not None and d > as_of
+
+
+def _rc_exempt(ditat: Optional[dict], rules: dict) -> bool:
+    customer = _norm_str(ditat.get("customer") if isinstance(ditat, dict) else None)
+    ok_customers = rules.get("rc_missing_ok_customers") or []
+    return bool(customer and any(c.lower() in customer for c in ok_customers))
+
+
+def diff_doc_completeness(ditat: Optional[dict], extracted: dict, rules: dict,
+                          as_of: Optional[date]) -> list[dict]:
+    """A DELIVERED shipment must have its docs. Missing RC/BOL/POD → critical.
+
+    Only fires once we can confirm delivery (delivery date ≤ as_of). RC is
+    exempt for the configured rc_missing_ok_customers (e.g. Amazon).
+    """
+    out: list[dict] = []
+    if as_of is None:
+        return out
+    ddate = delivery_date(ditat)
+    if ddate is None or ddate > as_of:
+        return out  # unknown or not yet delivered — can't require docs
+    missing = extracted.get("docs_missing") if isinstance(extracted, dict) else None
+    if not missing:
+        return out
+    rc_exempt = _rc_exempt(ditat, rules)
+    for doc in ("RC", "BOL", "POD"):
+        if doc not in missing:
+            continue
+        if doc == "RC" and rc_exempt:
+            continue
+        out.append({
+            "pair": "Docs", "field": doc,
+            "a": "(missing)", "b": "required (delivered)",
+            "severity": CRIT,
+            "message": f"delivered shipment missing {doc}",
+        })
+    return out
+
+
 # ---------------------------------------------------------------- top-level
 
-def run_diff(ditat: dict, extracted: dict, rules: Optional[dict] = None) -> dict:
+def run_diff(ditat: dict, extracted: dict, rules: Optional[dict] = None,
+             as_of: Optional[date] = None) -> dict:
     """Run all cross-checks. Returns dict with findings + counters + verdict.
 
-    `rules` defaults to the built-in defaults; pass a dict from rules.load_rules()
-    to override thresholds/policy.
+    `rules` defaults to the built-in defaults. `as_of` (today's date) enables the
+    delivered-shipment doc-completeness check; pass it from the caller.
     """
     if rules is None:
         rules = default_rules()
@@ -490,6 +546,7 @@ def run_diff(ditat: dict, extracted: dict, rules: Optional[dict] = None) -> dict
     pod = extracted.get("pod") if isinstance(extracted, dict) else None
 
     findings: list[dict] = []
+    findings.extend(diff_doc_completeness(ditat, extracted, rules, as_of))
     findings.extend(diff_rc_policy(rc, pod, rules))
     findings.extend(diff_bol_rc(bol, rc, rules))
     findings.extend(diff_pod_rc(pod, rc, rules, bol))
@@ -500,17 +557,13 @@ def run_diff(ditat: dict, extracted: dict, rules: Optional[dict] = None) -> dict
     warn = [f for f in findings if f["severity"] == WARN]
     info = [f for f in findings if f["severity"] == INFO]
 
-    if rc is None:
-        # Some customers (e.g. Amazon) routinely arrive without a rate
-        # confirmation PDF — downgrade to OK so they don't surface as problematic.
-        customer = _norm_str(ditat.get("customer") if isinstance(ditat, dict) else None)
-        ok_customers = rules.get("rc_missing_ok_customers") or []
-        if customer and any(c.lower() in customer for c in ok_customers):
-            verdict = "OK"
-        else:
-            verdict = "RC MISSING"
-    elif crit:
+    if crit:
         verdict = "ISSUES"
+    elif rc is None:
+        # No RC and nothing else flagged. Exempt customers (e.g. Amazon) → OK;
+        # otherwise surface as RC MISSING (delivered+missing RC already became a
+        # critical above, so this path is the not-confirmed-delivered case).
+        verdict = "OK" if _rc_exempt(ditat, rules) else "RC MISSING"
     elif warn:
         verdict = "WARN"
     else:
