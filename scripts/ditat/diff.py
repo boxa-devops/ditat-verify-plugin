@@ -61,14 +61,22 @@ def _to_int(v: Any) -> Optional[int]:
     return int(f) if f is not None else None
 
 
-_DATE_PATTERNS = (
-    "%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%m-%d-%Y",
-    "%d-%b-%Y", "%d %b %Y", "%b %d, %Y", "%B %d, %Y",
-    "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S",
-)
+_MONTHS = {m.lower(): i for i, m in enumerate(
+    ["January", "February", "March", "April", "May", "June", "July", "August",
+     "September", "October", "November", "December"], start=1)}
+_MONTHS.update({m.lower(): i for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
+     "Nov", "Dec"], start=1)})
+_MONTHS["sept"] = 9
 
 
 def _to_date(v: Any) -> Optional[date]:
+    """Parse a date out of almost any carrier-doc string.
+
+    Finds the date ANYWHERE in the text, so trailing times/separators don't break
+    it: "Jun 3, 2026 · 08:00", "Delivery: 06/03/2026", "2026-06-03T08:00Z" all
+    work. Numeric M/D/Y is read US-style.
+    """
     if v is None:
         return None
     if isinstance(v, datetime):
@@ -78,23 +86,34 @@ def _to_date(v: Any) -> Optional[date]:
     s = str(v).strip()
     if not s:
         return None
-    # Try ISO first via fromisoformat (handles offsets)
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
     except (ValueError, TypeError):
         pass
-    for fmt in _DATE_PATTERNS:
+
+    def _mk(y: int, mo: int, d: int) -> Optional[date]:
         try:
-            return datetime.strptime(s[: len(fmt) + 4], fmt).date()
-        except ValueError:
-            continue
-    # Last resort — extract YYYY-MM-DD substring
-    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
-    if m:
-        try:
-            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            return date(y, mo, d)
         except ValueError:
             return None
+
+    # ISO yyyy-mm-dd anywhere
+    m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if m:
+        return _mk(int(m[1]), int(m[2]), int(m[3]))
+    # "Jun 3, 2026" / "June 3 2026" (month name first)
+    m = re.search(r"\b([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b", s)
+    if m and m[1].lower() in _MONTHS:
+        return _mk(int(m[3]), _MONTHS[m[1].lower()], int(m[2]))
+    # "3 Jun 2026" (day first)
+    m = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})\b", s)
+    if m and m[2].lower() in _MONTHS:
+        return _mk(int(m[3]), _MONTHS[m[2].lower()], int(m[1]))
+    # Numeric M/D/Y or M-D-Y (US order)
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b", s)
+    if m:
+        yr = int(m[3])
+        return _mk(yr + 2000 if yr < 100 else yr, int(m[1]), int(m[2]))
     return None
 
 

@@ -191,6 +191,10 @@ The helper merges atomically (last-write-wins per shipment_key). The skeleton's 
 actual pickup/delivery date from the POD if present, else the BOL, else fall back
 to the Ditat trip (shipment) dates. For SH-…688-type cases where the BOL/POD scan
 is unreadable, use the Ditat dates rather than leaving them blank.
+- These dates often appear **inline inside the Shipper/Consignee block**, e.g.
+  `Pickup: Jun 2, 2026 · 08:00-15:00` and `Delivery: Jun 3, 2026 · 08:00` — not as
+  a labeled column. Capture them. The parser handles trailing times/separators
+  (`Jun 3, 2026 · 08:00`, `06/03/2026`, ISO), so the raw string is fine.
 
 **Page completeness (`pages_present` / `pages_expected`) — per BOL and POD.**
 If the document says "Page 1 of 11", set `pages_expected: 11`. Set

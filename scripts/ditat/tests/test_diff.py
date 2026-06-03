@@ -377,6 +377,23 @@ class TestComparators(unittest.TestCase):
         self.assertIsNone(diff._cmp_date("2026-05-01", None))
         self.assertIsNone(diff._cmp_date(None, "2026-05-01"))
 
+    def test_to_date_parses_messy_carrier_strings(self):
+        from datetime import date
+        cases = {
+            "Jun 3, 2026 · 08:00": date(2026, 6, 3),     # the SH-9708 BOL case
+            "Delivery: Jun 3, 2026 • 08:00": date(2026, 6, 3),
+            "June 3 2026": date(2026, 6, 3),
+            "3 Jun 2026": date(2026, 6, 3),
+            "06/03/2026": date(2026, 6, 3),
+            "6/3/26": date(2026, 6, 3),
+            "2026-06-03T08:00:00.000Z": date(2026, 6, 3),
+            "Sept 9, 2026": date(2026, 9, 9),
+        }
+        for s, expected in cases.items():
+            self.assertEqual(diff._to_date(s), expected, s)
+        self.assertIsNone(diff._to_date("no date here"))
+        self.assertIsNone(diff._to_date(None))
+
     def test_bol_rc_delivery_date_missing_on_bol_no_warn(self):
         bol = {k: v for k, v in _BOL_OK.items() if k != "delivery_date"}
         r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
