@@ -88,6 +88,7 @@ FINDING_SEV_COLOR = {
     "critical":   RGBColor(0xB0, 0x00, 0x20),  # red
     "warn":       RGBColor(0xA0, 0x52, 0x00),  # amber
     "info":       RGBColor(0x70, 0x70, 0x70),  # gray
+    "ok":         RGBColor(0x10, 0x70, 0x20),  # green
     "RC MISSING": RGBColor(0xA0, 0x52, 0x00),  # amber
 }
 
@@ -104,8 +105,9 @@ def _shade_cell(cell, fill: str) -> None:
     cell._tc.get_or_add_tcPr().append(shd)
 
 
-def _add_banner_row(table, text: str) -> None:
-    """A shaded full-width row separating one shipment's findings from the next."""
+def _add_banner_row(table, text: str, color=None) -> None:
+    """A shaded full-width row separating one shipment's findings from the next.
+    Text is colored by verdict (green OK / red ISSUES / amber WARN)."""
     cells = table.add_row().cells
     merged = cells[0]
     for c in cells[1:]:
@@ -114,6 +116,8 @@ def _add_banner_row(table, text: str) -> None:
     for p in merged.paragraphs:
         for r in p.runs:
             r.bold = True
+            if color is not None:
+                r.font.color.rgb = color
     _shade_cell(merged, BANNER_FILL)
 
 
@@ -133,7 +137,7 @@ def _add_findings_table(doc: Document, groups: list[dict]) -> None:
                 r.bold = True
 
     for g in groups:
-        _add_banner_row(table, g["banner"])
+        _add_banner_row(table, g["banner"], SEVERITY_COLOR.get(g["verdict"]))
         for r in g["rows"]:
             cells = table.add_row().cells
             sev_cell = cells[0]
@@ -151,7 +155,7 @@ def _add_findings_table(doc: Document, groups: list[dict]) -> None:
             cells[5].text = str(r["note"])
 
 
-_SEV_RANK = {"critical": 0, "warn": 1, "info": 2, "RC MISSING": 3}
+_SEV_RANK = {"critical": 0, "warn": 1, "info": 2, "RC MISSING": 3, "ok": 4}
 
 
 def _city_state(loc: dict) -> str:
@@ -181,11 +185,15 @@ def _banner_text(ship, verdict: str, ncrit: int, nwarn: int, ditat: dict) -> str
     return "    ·    ".join(parts)
 
 
-def _findings_groups(problematic_keys, batch, diff_index, findings_index) -> list[dict]:
-    """Group findings per shipment: [{ship, verdict, banner, rows:[...]}], by ship."""
+def _findings_groups(keys, batch, diff_index, findings_index) -> list[dict]:
+    """Group findings per shipment: [{ship, verdict, banner, rows:[...]}], by ship.
+
+    Every shipment gets a group — OK loads show a single green 'no issues' row so
+    the report covers the whole batch, not just the problems.
+    """
     by_key = {e.get("shipment_key"): e for e in batch}
     groups: list[dict] = []
-    for key in problematic_keys:
+    for key in keys:
         entry = by_key.get(key, {})
         ship = entry.get("shipment_id") or key
         diff_result = diff_index.get(key) or {}
@@ -199,15 +207,19 @@ def _findings_groups(problematic_keys, batch, diff_index, findings_index) -> lis
                 "value": f["a"], "vs": f["b"], "note": f["message"],
             })
         if not rows:
-            rows.append({
-                "severity": verdict, "pair": "—", "field": "—",
-                "value": "", "vs": "", "note": "RC missing — no cross-check",
-            })
+            if verdict == "OK":
+                rows.append({"severity": "ok", "pair": "—", "field": "—",
+                             "value": "", "vs": "", "note": "no issues"})
+            else:  # RC MISSING with nothing to cross-check
+                rows.append({"severity": verdict, "pair": "—", "field": "—",
+                             "value": "", "vs": "", "note": "RC missing — no cross-check"})
         rows.sort(key=lambda r: _SEV_RANK.get(r["severity"], 9))
         banner = _banner_text(ship, verdict, len(crit), len(warn),
                               entry.get("ditat_fields") or {})
         groups.append({"ship": ship, "verdict": verdict, "banner": banner, "rows": rows})
-    groups.sort(key=lambda g: str(g["ship"]))
+    # Problems first (ISSUES, RC MISSING, WARN), OK last; then by ship.
+    order = {"ISSUES": 0, "RC MISSING": 1, "WARN": 2, "OK": 3}
+    groups.sort(key=lambda g: (order.get(g["verdict"], 9), str(g["ship"])))
     return groups
 
 
@@ -263,16 +275,16 @@ def build_batch_docx(
     if not anomalies_only:
         _add_summary_table(doc, summary_rows)
 
-    if problematic_keys:
+    all_keys = [e.get("shipment_key") for e in batch]
+    if all_keys:
         if not anomalies_only:
             doc.add_page_break()
-        doc.add_heading("Findings", level=1)
-        groups = _findings_groups(problematic_keys, batch, diff_index, findings_index)
+        doc.add_heading("Shipments", level=1)
+        groups = _findings_groups(all_keys, batch, diff_index, findings_index)
         _add_findings_table(doc, groups)
     else:
         doc.add_paragraph("")
-        p = doc.add_paragraph()
-        p.add_run("All shipments passed. No problematic shipments in this batch.").italic = True
+        doc.add_paragraph().add_run("No shipments in this batch.").italic = True
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(out_path)
