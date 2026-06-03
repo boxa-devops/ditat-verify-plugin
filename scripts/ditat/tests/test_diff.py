@@ -273,6 +273,33 @@ class TestVerdicts(unittest.TestCase):
         self.assertTrue(any(f["pair"] == "BOL↔RC" and f["field"] == "commodity"
                             for f in r["warn"]))
 
+    def test_location_mismatch_flag_warns(self):
+        ext = {"rc": _RC_OK, "bol": _BOL_OK, "pod": _POD_OK,
+               "pickup_location_mismatch": True}
+        r = diff.run_diff(_DITAT_OK, ext)
+        self.assertTrue(any(f["pair"] == "Location" and f["field"] == "pickup_location"
+                            for f in r["warn"]))
+
+    def test_location_not_flagged_without_flag(self):
+        bol = dict(_BOL_OK, shipper={"city": "Mars", "state": "XX"})
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
+        self.assertFalse(any(f["pair"] == "Location"
+                             for f in r["critical"] + r["warn"]))
+
+    # --- asymmetric one-sided rule: RC missing → skip; doc missing (RC has) → warn ---
+
+    def test_rc_omits_field_doc_has_it_is_skipped(self):
+        rc = {k: v for k, v in _RC_OK.items() if k != "weight_lbs"}  # RC has no weight
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=_POD_OK))
+        self.assertFalse(any(f["pair"] == "BOL↔RC" and f["field"] == "weight_lbs"
+                             for f in r["critical"] + r["warn"]))
+
+    def test_doc_omits_field_rc_has_it_warns(self):
+        bol = {k: v for k, v in _BOL_OK.items() if k != "weight_lbs"}  # BOL has no weight
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
+        self.assertTrue(any(f["pair"] == "BOL↔RC" and f["field"] == "weight_lbs"
+                            for f in r["warn"]))
+
     def test_incomplete_pages_is_critical(self):
         bol = dict(_BOL_OK, pages_expected=11, pages_present=1)
         r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))

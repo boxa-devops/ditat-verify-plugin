@@ -307,31 +307,41 @@ def _emit(findings: list[dict], pair: str, field: str, a: Any, b: Any,
     })
 
 
+def _is_blank(v: Any) -> bool:
+    return v is None or (isinstance(v, str) and not v.strip())
+
+
+def _rc_cmp(a: Any, b: Any, inner) -> tuple[str, str] | None:
+    """RC-vs-doc one-sided rule. `a` = BOL/POD/Ditat value, `b` = RC value.
+
+    - RC omits the field (b blank) → skip; the RC simply doesn't carry it.
+    - RC HAS it but the doc/Ditat side is blank (a blank) → warn (doc incomplete).
+    - both present → defer to `inner`.
+    """
+    if _is_blank(b):
+        return None
+    if _is_blank(a):
+        return (WARN, "missing here, present on RC")
+    return inner(a, b)
+
+
 def diff_bol_rc(bol: Optional[dict], rc: Optional[dict], rules: dict) -> list[dict]:
     out: list[dict] = []
     if not bol or not rc:
         return out
     pair = "BOL↔RC"
-    cmp_date = partial(_cmp_date, critical_days=rules["date"]["critical_days"])
-    cmp_str = partial(_cmp_str, severity_on_diff=rules["string_mismatch_severity"])
     cmp_w = partial(_cmp_overage_weight,
                     threshold_pct=rules["bol_rc_overage"]["weight_threshold_pct"])
     cmp_p = partial(_cmp_overage_int,
                     threshold_pct=rules["bol_rc_overage"]["pieces_threshold_pct"])
-    # bol_number intentionally NOT compared here — the RC does not carry a BOL number.
-    # pickup/delivery dates are handled by diff_dates (resolved POD→BOL→Ditat vs RC).
+    # Only deterministic numeric checks here. bol_number not compared (RC has
+    # none); dates → diff_dates; commodity + locations are semantic → judged by
+    # the LLM (diff_commodity / diff_locations).
     _emit(out, pair, "weight_lbs",
-          _doc_get(bol, "weight_lbs", "weight"), _doc_get(rc, "weight_lbs", "weight"), cmp_w)
+          _doc_get(bol, "weight_lbs", "weight"), _doc_get(rc, "weight_lbs", "weight"),
+          partial(_rc_cmp, inner=cmp_w))
     _emit(out, pair, "pieces",
-          _doc_get(bol, "pieces"), _doc_get(rc, "pieces"), cmp_p)
-    # commodity is judged by the LLM at extraction (semantic), relayed via the
-    # `commodity_mismatch` flag — see diff_commodity. Not compared here.
-    _emit(out, pair, "pickup_location",
-          _city_state(_doc_get(bol, "shipper", "pickup")),
-          _city_state(_doc_get(rc, "pickup_location", "pickup")), cmp_str)
-    _emit(out, pair, "delivery_location",
-          _city_state(_doc_get(bol, "consignee", "delivery")),
-          _city_state(_doc_get(rc, "delivery_location", "delivery")), cmp_str)
+          _doc_get(bol, "pieces"), _doc_get(rc, "pieces"), partial(_rc_cmp, inner=cmp_p))
     return out
 
 
@@ -344,7 +354,8 @@ def diff_pod_rc(pod: Optional[dict], rc: Optional[dict], rules: dict,
     # bol_number: skip when BOL doc present — already covered by BOL↔POD.
     if not bol:
         _emit(out, pair, "bol_number",
-              _doc_get(pod, "bol_number"), _doc_get(rc, "bol_number"), _cmp_id)
+              _doc_get(pod, "bol_number"), _doc_get(rc, "bol_number"),
+              partial(_rc_cmp, inner=_cmp_id))
     # delivery_date handled by diff_dates (resolved POD→BOL→Ditat vs RC).
     # weight_received + pieces_received intentionally dropped — POD quantities
     # routinely diverge from RC (partial deliveries, short-loads) and produced noise.
@@ -363,33 +374,25 @@ def diff_ditat_rc(ditat: Optional[dict], rc: Optional[dict], rules: dict) -> lis
     if not ditat or not rc:
         return out
     pair = "Ditat↔RC"
-    cmp_str = partial(_cmp_str, severity_on_diff=rules["string_mismatch_severity"])
     cmp_weight = partial(_cmp_weight,
                          critical_pct=rules["weight_ditat_rc"]["critical_pct"],
                          warn_pct=rules["weight_ditat_rc"]["warn_pct"])
     cmp_money = partial(_cmp_money,
                         critical_abs=rules["money"]["critical_abs"],
                         critical_pct=rules["money"]["critical_pct"])
-    _emit(out, pair, "bol_number",
-          ditat.get("bol_number"), _doc_get(rc, "bol_number"), _cmp_id)
+    # bol_number + equipment_type NOT compared (RC has no BOL#; trailer wording
+    # noise). Locations are semantic → diff_locations (LLM).
     _emit(out, pair, "load_number",
-          ditat.get("load_number"), _doc_get(rc, "load_number"), _cmp_id)
+          ditat.get("load_number"), _doc_get(rc, "load_number"), partial(_rc_cmp, inner=_cmp_id))
     _emit(out, pair, "total_weight_lbs",
           ditat.get("total_weight_lbs"), _doc_get(rc, "weight_lbs", "weight"),
           partial(_cmp_ditat_qty, inner=cmp_weight))
     _emit(out, pair, "total_pieces",
           ditat.get("total_pieces"), _doc_get(rc, "pieces"),
           partial(_cmp_ditat_qty, inner=_cmp_int))
-    # equipment_type intentionally NOT compared — "53Van" vs "Dry Van 53'" etc are
-    # the same trailer in different words; produced noise with no value.
-    _emit(out, pair, "pickup_location",
-          _city_state(ditat.get("pickup")),
-          _city_state(_doc_get(rc, "pickup_location", "pickup")), cmp_str)
-    _emit(out, pair, "delivery_location",
-          _city_state(ditat.get("delivery")),
-          _city_state(_doc_get(rc, "delivery_location", "delivery")), cmp_str)
     _emit(out, pair, "revenue_vs_rate",
-          ditat.get("total_revenue"), _doc_get(rc, "agreed_rate", "rate"), cmp_money)
+          ditat.get("total_revenue"), _doc_get(rc, "agreed_rate", "rate"),
+          partial(_rc_cmp, inner=cmp_money))
     return out
 
 
@@ -554,7 +557,8 @@ def diff_dates(ditat: Optional[dict], extracted: dict, rc: Optional[dict],
     out: list[dict] = []
     if not rc:
         return out
-    cmp_date = partial(_cmp_date, critical_days=rules["date"]["critical_days"])
+    cmp_date = partial(_rc_cmp,
+                       inner=partial(_cmp_date, critical_days=rules["date"]["critical_days"]))
     _emit(out, "Dates", "pickup_date",
           _resolve_trip_date(extracted, ditat, "pickup"),
           _doc_get(rc, "pickup_date"), cmp_date)
@@ -685,6 +689,31 @@ def diff_commodity(extracted: dict) -> list[dict]:
     }]
 
 
+def diff_locations(extracted: dict, ditat: Optional[dict]) -> list[dict]:
+    """Pickup/delivery locations are semantic (place names, formats vary) →
+    judged by the LLM. The agent sets `pickup_location_mismatch` /
+    `delivery_location_mismatch` only when the route genuinely differs across the
+    docs; we relay as a warn."""
+    out: list[dict] = []
+    if not isinstance(extracted, dict):
+        return out
+    rc = extracted.get("rc") or {}
+    bol = extracted.get("bol") or {}
+    for which, flag, bol_key in (("pickup", "pickup_location_mismatch", "shipper"),
+                                 ("delivery", "delivery_location_mismatch", "consignee")):
+        if not extracted.get(flag):
+            continue
+        rc_loc = _city_state(_doc_get(rc, f"{which}_location", which))
+        other = (_city_state(_doc_get(bol, bol_key, which))
+                 or _city_state((ditat or {}).get(which)))
+        out.append({
+            "pair": "Location", "field": f"{which}_location",
+            "a": _fmt(other), "b": _fmt(rc_loc),
+            "severity": WARN, "message": "locations differ (LLM)",
+        })
+    return out
+
+
 # ---------------------------------------------------------------- top-level
 
 def run_diff(ditat: dict, extracted: dict, rules: Optional[dict] = None,
@@ -710,6 +739,7 @@ def run_diff(ditat: dict, extracted: dict, rules: Optional[dict] = None,
     findings.extend(diff_bol_pod(bol, pod))
     findings.extend(diff_dates(ditat, extracted, rc, rules))
     findings.extend(diff_commodity(extracted))
+    findings.extend(diff_locations(extracted, ditat))
 
     crit = [f for f in findings if f["severity"] == CRIT]
     warn = [f for f in findings if f["severity"] == WARN]

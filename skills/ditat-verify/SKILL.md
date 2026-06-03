@@ -162,7 +162,9 @@ Chunk file schema (list form):
                "damages_notes": null,
                "arrival_time": "2026-06-03T08:00", "departure_time": "2026-06-03T12:30",
                "pages_present": 1, "pages_expected": 1 },
-      "commodity_mismatch": false
+      "commodity_mismatch": false,
+      "pickup_location_mismatch": false,
+      "delivery_location_mismatch": false
     },
     "docs_missing": []
   }
@@ -257,7 +259,7 @@ The helper:
 | BOL↔RC        | pieces                         | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |
 | Dates         | pickup_date, delivery_date     | resolved date **POD → BOL → Ditat trip** vs RC; Δ > 1d → critical; Δ = 1d → warn. Both sides must have a date (one-sided absence = no flag). |
 | BOL↔RC        | commodity                      | **judged by YOU (LLM)** — set `commodity_mismatch: true` only when BOL & RC are genuinely different freight; relayed as a warn. Python does not compare commodity text. |
-| BOL↔RC        | locations                      | normalized string compare; mismatch → warn (fuzzy → info)              |
+| Location      | pickup_location, delivery_location | **judged by YOU (LLM)** — set `pickup_location_mismatch` / `delivery_location_mismatch` only when the route genuinely differs across docs; relayed as a warn. Python does not compare location text. |
 | POD↔RC        | bol_number                     | **skipped when BOL doc present** — BOL↔POD covers it                   |
 | POD↔RC        | weight_received, pieces_received | **dropped** — POD quantities diverge on partial deliveries           |
 | POD↔RC        | damages_notes                  | any damages → warn                                                     |
@@ -271,14 +273,20 @@ The helper:
 **Not compared** (intentionally removed — produced noise, no value):
 - BOL↔RC `bol_number` — the RC carries no BOL number.
 - Ditat↔RC `bol_number`, `equipment_type` — RC has no BOL number; "53Van" vs "Dry Van 53'" is the same trailer.
-- **One-sided absence never warns** — if a field is present on one side only (often the RC simply omits it), it's not flagged. Whole-document absence is the Docs check; single-field absence is not.
+- **One-sided absence (asymmetric):** a field missing in the **RC** but present on
+  the BOL/POD/Ditat → **skip** (the RC just doesn't carry it). A field present on
+  the **RC** but missing on the doc/Ditat side → **warn** (the doc is incomplete).
+  Both missing → nothing. Whole-document absence is the Docs critical.
 - **Amazon loads** (`skip_customers`) — excluded entirely; not our process.
 
-**Commodity — you judge it (semantic, not Python).** Compare the BOL and RC
-commodity descriptions yourself; set `commodity_mismatch: true` (at the
-`extracted` level) ONLY when they're genuinely different freight. Same freight in
-different words ("Coffee closures / food grade packaging" vs "Packaging
-Materials") → leave it false/omit. Python never compares commodity text.
+**Semantic fields — YOU judge them (not Python).** Set these flags at the
+`extracted` level only when genuinely different; same thing in different words →
+leave false/omit:
+- `commodity_mismatch` — BOL vs RC freight (e.g. "Coffee closures / food grade
+  packaging" vs "Packaging Materials" → same, leave false).
+- `pickup_location_mismatch` / `delivery_location_mismatch` — route city/state
+  across the docs + Ditat (formatting/abbreviation differences are NOT a mismatch).
+Python never compares commodity or location text.
 
 **Special-case verdict:**
 - RC missing **and** customer name matches an entry in `rc_missing_ok_customers` (default: `amazon`) → verdict downgraded from `RC MISSING` to `OK`.
