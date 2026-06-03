@@ -329,10 +329,7 @@ def diff_bol_rc(bol: Optional[dict], rc: Optional[dict], rules: dict) -> list[di
     cmp_p = partial(_cmp_overage_int,
                     threshold_pct=rules["bol_rc_overage"]["pieces_threshold_pct"])
     # bol_number intentionally NOT compared here — the RC does not carry a BOL number.
-    _emit(out, pair, "pickup_date",
-          _doc_get(bol, "pickup_date"), _doc_get(rc, "pickup_date"), cmp_date)
-    _emit(out, pair, "delivery_date",
-          _doc_get(bol, "delivery_date"), _doc_get(rc, "delivery_date"), cmp_date)
+    # pickup/delivery dates are handled by diff_dates (resolved POD→BOL→Ditat vs RC).
     _emit(out, pair, "weight_lbs",
           _doc_get(bol, "weight_lbs", "weight"), _doc_get(rc, "weight_lbs", "weight"), cmp_w)
     _emit(out, pair, "pieces",
@@ -354,13 +351,11 @@ def diff_pod_rc(pod: Optional[dict], rc: Optional[dict], rules: dict,
     if not pod or not rc:
         return out
     pair = "POD↔RC"
-    cmp_date = partial(_cmp_date, critical_days=rules["date"]["critical_days"])
-    # bol_number: skip when BOL doc present — already covered by BOL↔RC and BOL↔POD.
+    # bol_number: skip when BOL doc present — already covered by BOL↔POD.
     if not bol:
         _emit(out, pair, "bol_number",
               _doc_get(pod, "bol_number"), _doc_get(rc, "bol_number"), _cmp_id)
-    _emit(out, pair, "delivery_date",
-          _doc_get(pod, "delivery_date"), _doc_get(rc, "delivery_date"), cmp_date)
+    # delivery_date handled by diff_dates (resolved POD→BOL→Ditat vs RC).
     # weight_received + pieces_received intentionally dropped — POD quantities
     # routinely diverge from RC (partial deliveries, short-loads) and produced noise.
     damages = _doc_get(pod, "damages_notes", "damages")
@@ -504,6 +499,41 @@ def diff_bol_pod(bol: Optional[dict], pod: Optional[dict]) -> list[dict]:
     return out
 
 
+def _resolve_trip_date(extracted: Optional[dict], ditat: Optional[dict],
+                       which: str) -> Any:
+    """Actual pickup/delivery date, sourced POD → BOL → Ditat trip (fallback).
+
+    `which` is "pickup" or "delivery". So an unreadable or blank doc date still
+    resolves from the Ditat trip appointment rather than dropping the check.
+    """
+    key = f"{which}_date"
+    if isinstance(extracted, dict):
+        for doc in (extracted.get("pod"), extracted.get("bol")):
+            v = _doc_get(doc, key)
+            if v:
+                return v
+    stop = ditat.get(which) if isinstance(ditat, dict) else None
+    if isinstance(stop, dict):
+        return stop.get("appointment_from") or stop.get("appointment_to") or stop.get("date")
+    return None
+
+
+def diff_dates(ditat: Optional[dict], extracted: dict, rc: Optional[dict],
+               rules: dict) -> list[dict]:
+    """Pickup/delivery date vs the RC, using the resolved (POD→BOL→Ditat) date."""
+    out: list[dict] = []
+    if not rc:
+        return out
+    cmp_date = partial(_cmp_date, critical_days=rules["date"]["critical_days"])
+    _emit(out, "Dates", "pickup_date",
+          _resolve_trip_date(extracted, ditat, "pickup"),
+          _doc_get(rc, "pickup_date"), cmp_date)
+    _emit(out, "Dates", "delivery_date",
+          _resolve_trip_date(extracted, ditat, "delivery"),
+          _doc_get(rc, "delivery_date"), cmp_date)
+    return out
+
+
 # ---------------------------------------------------------------- delivery status
 
 def delivery_date(ditat: Optional[dict]) -> Optional[date]:
@@ -633,6 +663,7 @@ def run_diff(ditat: dict, extracted: dict, rules: Optional[dict] = None,
     findings.extend(diff_pod_rc(pod, rc, rules, bol))
     findings.extend(diff_ditat_rc(ditat, rc, rules))
     findings.extend(diff_bol_pod(bol, pod))
+    findings.extend(diff_dates(ditat, extracted, rc, rules))
 
     crit = [f for f in findings if f["severity"] == CRIT]
     warn = [f for f in findings if f["severity"] == WARN]

@@ -383,6 +383,20 @@ class TestComparators(unittest.TestCase):
         self.assertFalse(any(f["pair"] == "BOL↔RC" and f["field"] == "delivery_date"
                              for f in r["critical"] + r["warn"]))
 
+    def test_delivery_date_falls_back_to_ditat_when_docs_blank(self):
+        # No POD/BOL delivery date; Ditat trip carries it → resolved from Ditat.
+        ditat = _delivered("2026-05-03")  # ditat delivery appt = RC delivery
+        bol = {k: v for k, v in _BOL_OK.items() if k != "delivery_date"}
+        r = diff.run_diff(ditat, {"rc": _RC_OK, "bol": bol})  # no pod
+        self.assertFalse(any(f["field"] == "delivery_date"
+                             for f in r["critical"] + r["warn"]))
+
+    def test_delivery_date_ditat_fallback_flags_real_mismatch(self):
+        ditat = _delivered("2026-05-10")  # ditat delivery 7d off from RC 05-03
+        r = diff.run_diff(ditat, {"rc": _RC_OK})  # no bol/pod
+        self.assertTrue(any(f["pair"] == "Dates" and f["field"] == "delivery_date"
+                            for f in r["critical"]))
+
 
 if __name__ == "__main__":
     unittest.main()

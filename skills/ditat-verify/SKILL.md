@@ -240,10 +240,9 @@ The helper:
 | RC-policy     | layover                        | RC states layover terms → accepted (no flag). RC silent **and** POD in/out wait ≥ 5h → critical |
 | BOL↔RC        | weight_lbs                     | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |
 | BOL↔RC        | pieces                         | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |
-| BOL↔RC        | dates                          | Δ > 1d → critical; Δ = 1d → warn                                       |
+| Dates         | pickup_date, delivery_date     | resolved date **POD → BOL → Ditat trip** vs RC; Δ > 1d → critical; Δ = 1d → warn. Both sides must have a date (one-sided absence = no flag). |
 | BOL↔RC        | commodity                      | **lenient "like" compare** — match if one contains the other or they share a meaningful word; only fully unrelated → warn |
 | BOL↔RC        | locations                      | normalized string compare; mismatch → warn (fuzzy → info)              |
-| POD↔RC        | delivery_date                  | Δ > 1d → critical; Δ = 1d → warn                                       |
 | POD↔RC        | bol_number                     | **skipped when BOL doc present** — BOL↔POD covers it                   |
 | POD↔RC        | weight_received, pieces_received | **dropped** — POD quantities diverge on partial deliveries           |
 | POD↔RC        | damages_notes                  | any damages → warn                                                     |
