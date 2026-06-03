@@ -223,6 +223,23 @@ class TestVerdicts(unittest.TestCase):
         self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "detention"
                             for f in r["critical"]))
 
+    def test_layover_multiday_full_datetime(self):
+        # Full datetimes spanning to next day → 20h wait ≥ 5h layover threshold.
+        rc = {k: v for k, v in _RC_OK.items() if not k.startswith("layover_")}
+        pod = dict(_POD_OK, arrival_time="2026-05-03T14:00",
+                   departure_time="2026-05-04T10:00")  # 20h
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=pod))
+        self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "layover"
+                            for f in r["critical"]))
+
+    def test_pickup_side_detention_from_bol(self):
+        # Detention at PICKUP, in/out times on the BOL, RC silent on detention.
+        rc = {k: v for k, v in _RC_OK.items() if not k.startswith("detention_")}
+        bol = dict(_BOL_OK, pickup_arrival_time="08:00", pickup_departure_time="12:00")  # 4h
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=bol, pod=_POD_OK))
+        self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "detention"
+                            for f in r["critical"]))
+
     def test_damages_emits_warning(self):
         pod = dict(_POD_OK, damages_notes="1 pallet damaged")
         r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=_BOL_OK, pod=pod))
@@ -241,17 +258,18 @@ class TestVerdicts(unittest.TestCase):
         self.assertFalse(any(f["pair"] == "Ditat↔RC" and f["field"] == "equipment_type"
                              for f in r["critical"] + r["warn"]))
 
-    def test_commodity_like_shares_word_is_not_flagged(self):
-        bol = dict(_BOL_OK, commodity="Coffee closures / food grade packaging")
-        rc = dict(_RC_OK, commodity="Packaging Materials")
-        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=bol, pod=_POD_OK))
-        self.assertFalse(any(f["pair"] == "BOL↔RC" and f["field"] == "commodity"
-                             for f in r["warn"]))
-
-    def test_commodity_unrelated_is_warn(self):
+    def test_commodity_not_flagged_without_llm_flag(self):
+        # Python no longer judges commodity; differing text alone = no finding.
         bol = dict(_BOL_OK, commodity="Electronics")
         rc = dict(_RC_OK, commodity="Frozen Beef")
         r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=bol, pod=_POD_OK))
+        self.assertFalse(any(f["field"] == "commodity"
+                             for f in r["critical"] + r["warn"]))
+
+    def test_commodity_mismatch_flag_warns(self):
+        # LLM sets commodity_mismatch=True → relayed as a warn.
+        ext = {"rc": _RC_OK, "bol": _BOL_OK, "pod": _POD_OK, "commodity_mismatch": True}
+        r = diff.run_diff(_DITAT_OK, ext)
         self.assertTrue(any(f["pair"] == "BOL↔RC" and f["field"] == "commodity"
                             for f in r["warn"]))
 
@@ -359,9 +377,9 @@ class TestComparators(unittest.TestCase):
     def test_weight_comparator_returns_none_when_both_absent(self):
         self.assertIsNone(diff._cmp_weight(None, None))
 
-    def test_weight_missing_one_side_is_warn(self):
-        sev, _ = diff._cmp_weight(None, 100)
-        self.assertEqual(sev, "warn")
+    def test_weight_missing_one_side_not_flagged(self):
+        self.assertIsNone(diff._cmp_weight(None, 100))
+        self.assertIsNone(diff._cmp_weight(100, None))
 
     def test_id_mismatch_is_critical(self):
         sev, _ = diff._cmp_id("A", "B")

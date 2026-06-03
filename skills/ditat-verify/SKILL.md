@@ -152,15 +152,17 @@ Chunk file schema (list form):
                "delivery_location": { "city": "...", "state": "..." },
                "commodity": "...", "weight_lbs": 42000, "pieces": 24 },
       "bol": { "bol_number": "...", "weight_lbs": 42000, "pieces": 24,
-               "pickup_date": "...", "delivery_date": "...",
+               "pickup_date": "2026-06-02", "delivery_date": "2026-06-03",
                "shipper":   { "city": "...", "state": "..." },
                "consignee": { "city": "...", "state": "..." },
-               "commodity": "...", "pages_present": 11, "pages_expected": 11 },
-      "pod": { "bol_number": "...", "delivery_date": "...", "signed_by": "...",
+               "commodity": "...", "pages_present": 11, "pages_expected": 11,
+               "pickup_arrival_time": "2026-06-02T08:00", "pickup_departure_time": "2026-06-02T12:00" },
+      "pod": { "bol_number": "...", "delivery_date": "2026-06-03", "signed_by": "...",
                "pieces_received": 24, "weight_received_lbs": 41950,
                "damages_notes": null,
-               "arrival_time": "08:00", "departure_time": "12:30",
-               "pages_present": 1, "pages_expected": 1 }
+               "arrival_time": "2026-06-03T08:00", "departure_time": "2026-06-03T12:30",
+               "pages_present": 1, "pages_expected": 1 },
+      "commodity_mismatch": false
     },
     "docs_missing": []
   }
@@ -204,9 +206,15 @@ If the document says "Page 1 of 11", set `pages_expected: 11`. Set
 **critical** when `pages_expected > pages_present` (e.g. an 11-page BOL uploaded
 as 1 page — all pages must be present). Omit both keys if there's no "of N" marker.
 
-**POD in/out times (drive accessorial detection):**
-- `arrival_time` / `departure_time` — the in/out (check-in / check-out) times stamped on the delivery receipt. Accept `HH:MM`, `H:MM AM/PM`, or full ISO datetime. Omit if the POD doesn't show them.
-- The diff computes wait = departure − arrival. If wait exceeds the default free hours and the **RC is silent** on detention, that's flagged (see RC-policy rules). Without these times, no accessorial occurrence can be detected.
+**In/out times — exact times drive detention & layover (you extract them):**
+- **Delivery stop:** `arrival_time` / `departure_time` (check-in / check-out on the POD).
+- **Pickup stop:** `pickup_arrival_time` / `pickup_departure_time` (on the BOL or POD).
+- Give the **exact time**. Prefer a **full datetime** (`2026-06-03T14:30`) so a wait
+  that crosses midnight or spans days (layover) is measured correctly. `HH:MM` /
+  `H:MM AM/PM` are accepted for same-day waits. Omit if the doc doesn't show them.
+- The diff takes the longest wait (departure − arrival) across both stops. If it
+  exceeds free hours and the **RC is silent** on detention/layover, it's flagged
+  (see RC-policy rules). No in/out times → nothing detected.
 
 **RC accessorial extraction notes (the RC governs):**
 - `detention_rate` — dollars per hour the carrier is paid for detention.
@@ -243,12 +251,12 @@ The helper:
 |---------------|--------------------------------|------------------------------------------------------------------------|
 | Docs          | RC / BOL / POD                 | **delivered** shipment missing any of RC/BOL/POD → critical (RC exempt for `rc_missing_ok_customers`). Pending + `skip_customers` (Amazon) excluded upstream. |
 | Docs          | pages                          | BOL/POD `pages_expected > pages_present` (e.g. "1 of 11" but 1 uploaded) → critical |
-| RC-policy     | detention                      | RC states detention terms → accepted (no flag). RC silent **and** POD in/out wait > 2h free → critical |
-| RC-policy     | layover                        | RC states layover terms → accepted (no flag). RC silent **and** POD in/out wait ≥ 5h → critical |
+| RC-policy     | detention                      | RC states detention terms → accepted (no flag). RC silent **and** in/out wait (pickup or delivery) > 2h free → critical |
+| RC-policy     | layover                        | RC states layover terms → accepted (no flag). RC silent **and** in/out wait ≥ 5h → critical |
 | BOL↔RC        | weight_lbs                     | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |
 | BOL↔RC        | pieces                         | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |
 | Dates         | pickup_date, delivery_date     | resolved date **POD → BOL → Ditat trip** vs RC; Δ > 1d → critical; Δ = 1d → warn. Both sides must have a date (one-sided absence = no flag). |
-| BOL↔RC        | commodity                      | **lenient "like" compare** — match if one contains the other or they share a meaningful word; only fully unrelated → warn |
+| BOL↔RC        | commodity                      | **judged by YOU (LLM)** — set `commodity_mismatch: true` only when BOL & RC are genuinely different freight; relayed as a warn. Python does not compare commodity text. |
 | BOL↔RC        | locations                      | normalized string compare; mismatch → warn (fuzzy → info)              |
 | POD↔RC        | bol_number                     | **skipped when BOL doc present** — BOL↔POD covers it                   |
 | POD↔RC        | weight_received, pieces_received | **dropped** — POD quantities diverge on partial deliveries           |
@@ -263,7 +271,14 @@ The helper:
 **Not compared** (intentionally removed — produced noise, no value):
 - BOL↔RC `bol_number` — the RC carries no BOL number.
 - Ditat↔RC `bol_number`, `equipment_type` — RC has no BOL number; "53Van" vs "Dry Van 53'" is the same trailer.
+- **One-sided absence never warns** — if a field is present on one side only (often the RC simply omits it), it's not flagged. Whole-document absence is the Docs check; single-field absence is not.
 - **Amazon loads** (`skip_customers`) — excluded entirely; not our process.
+
+**Commodity — you judge it (semantic, not Python).** Compare the BOL and RC
+commodity descriptions yourself; set `commodity_mismatch: true` (at the
+`extracted` level) ONLY when they're genuinely different freight. Same freight in
+different words ("Coffee closures / food grade packaging" vs "Packaging
+Materials") → leave it false/omit. Python never compares commodity text.
 
 **Special-case verdict:**
 - RC missing **and** customer name matches an entry in `rc_missing_ok_customers` (default: `amazon`) → verdict downgraded from `RC MISSING` to `OK`.
