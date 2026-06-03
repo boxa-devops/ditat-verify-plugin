@@ -182,10 +182,11 @@ def _cmp_money(a: Any, b: Any, critical_abs: float = 1.0,
 
 def _cmp_date(a: Any, b: Any, critical_days: int = 1) -> tuple[str, str] | None:
     da, db = _to_date(a), _to_date(b)
-    if da is None and db is None:
-        return None
+    # Only compare when BOTH dates are present. A doc that simply omits a date
+    # (e.g. a BOL with no delivery date) is not a discrepancy — the date is read
+    # from whichever doc carries it (POD → BOL → Ditat). No flag for one-sided.
     if da is None or db is None:
-        return (WARN, "missing on one side")
+        return None
     delta_days = (da - db).days
     if abs(delta_days) > critical_days:
         return (CRIT, f"{delta_days:+d}d")

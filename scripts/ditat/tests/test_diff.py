@@ -372,6 +372,17 @@ class TestComparators(unittest.TestCase):
         self.assertEqual(sev, "info")
         self.assertIn("fuzzy", msg)
 
+    def test_date_missing_one_side_not_flagged(self):
+        # A date present on only one doc is not a discrepancy.
+        self.assertIsNone(diff._cmp_date("2026-05-01", None))
+        self.assertIsNone(diff._cmp_date(None, "2026-05-01"))
+
+    def test_bol_rc_delivery_date_missing_on_bol_no_warn(self):
+        bol = {k: v for k, v in _BOL_OK.items() if k != "delivery_date"}
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
+        self.assertFalse(any(f["pair"] == "BOL↔RC" and f["field"] == "delivery_date"
+                             for f in r["critical"] + r["warn"]))
+
 
 if __name__ == "__main__":
     unittest.main()
