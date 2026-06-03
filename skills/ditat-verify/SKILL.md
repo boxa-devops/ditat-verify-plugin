@@ -114,7 +114,9 @@ Stdout JSON:
 }
 ```
 
-**Only DELIVERED shipments are returned.** The server excludes any load whose delivery date is still in the future (not done yet — its docs aren't due). `finalize` also drops pending defensively and reports `skipped_pending`.
+**Only finished loads are returned.** The server filters to shipment status **Completed** or **Cancelled** (excludes Invoiced and in-progress; override via the `statuses` query / `DITAT_VERIFY_STATUSES`). Status is authoritative; for loads without a status it falls back to "delivery date has passed". `finalize` also drops pending defensively and reports `skipped_pending`.
+
+**Cancelled loads** are verified but **exempt from doc-completeness** — they were never delivered, so missing BOL/POD is expected, not a critical.
 
 If `count == 0`: tell user "no delivered shipments in this window" and stop. **Do not call `finalize`.**
 

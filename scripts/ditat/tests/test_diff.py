@@ -332,6 +332,27 @@ class TestDeliveryAndCompleteness(unittest.TestCase):
         r = diff.run_diff(_delivered(), ext)  # as_of omitted
         self.assertFalse(any(f["pair"] == "Docs" for f in r["critical"]))
 
+    def test_completed_status_requires_docs_no_date_needed(self):
+        # Status=Completed is authoritative — missing docs critical even without as_of.
+        ditat = dict(_DITAT_OK, status="Completed")
+        ext = {"rc": _RC_OK, "docs_missing": ["BOL", "POD"]}
+        r = diff.run_diff(ditat, ext)  # no as_of, no delivery date
+        self.assertTrue(any(f["pair"] == "Docs" and f["field"] == "BOL"
+                            for f in r["critical"]))
+
+    def test_cancelled_status_exempt_from_doc_completeness(self):
+        ditat = dict(_DITAT_OK, status="Cancelled")
+        ext = {"rc": _RC_OK, "docs_missing": ["BOL", "POD"]}
+        r = diff.run_diff(ditat, ext, as_of=_AS_OF)
+        self.assertFalse(any(f["pair"] == "Docs" for f in r["critical"]))
+
+    def test_terminal_status_never_pending(self):
+        # Cancelled with a future delivery date is still terminal (not pending).
+        ditat = dict(_delivered("2026-06-20"), status="Cancelled")
+        self.assertFalse(diff.is_pending(ditat, _AS_OF))
+        completed = dict(_delivered("2026-06-20"), status="Completed")
+        self.assertFalse(diff.is_pending(completed, _AS_OF))
+
 
 class TestComparators(unittest.TestCase):
 

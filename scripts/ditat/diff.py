@@ -513,8 +513,21 @@ def delivery_date(ditat: Optional[dict]) -> Optional[date]:
     return _to_date(d.get("appointment_to") or d.get("appointment_from") or d.get("date"))
 
 
+_TERMINAL_STATUSES = {"completed", "cancelled", "canceled"}
+
+
+def _status(ditat: Optional[dict]) -> Optional[str]:
+    return _norm_str(ditat.get("status") if isinstance(ditat, dict) else None)
+
+
 def is_pending(ditat: Optional[dict], as_of: Optional[date]) -> bool:
-    """True when the delivery date is known and still in the future (not delivered)."""
+    """True when the shipment is not yet done.
+
+    A terminal status (Completed / Cancelled) is authoritative → never pending.
+    Without a status, fall back to the delivery-date proxy (future = pending).
+    """
+    if _status(ditat) in _TERMINAL_STATUSES:
+        return False
     if as_of is None:
         return False
     d = delivery_date(ditat)
@@ -561,17 +574,23 @@ def diff_doc_pages(extracted: dict) -> list[dict]:
 
 def diff_doc_completeness(ditat: Optional[dict], extracted: dict, rules: dict,
                           as_of: Optional[date]) -> list[dict]:
-    """A DELIVERED shipment must have its docs. Missing RC/BOL/POD → critical.
+    """A COMPLETED shipment must have its docs. Missing RC/BOL/POD → critical.
 
-    Only fires once we can confirm delivery (delivery date ≤ as_of). RC is
-    exempt for the configured rc_missing_ok_customers (e.g. Amazon).
+    Fires when status is Completed, or (no status) the delivery date has passed.
+    Cancelled loads are exempt — never delivered, so missing docs are expected.
+    RC is also exempt for the configured rc_missing_ok_customers (e.g. Amazon).
     """
     out: list[dict] = []
-    if as_of is None:
-        return out
-    ddate = delivery_date(ditat)
-    if ddate is None or ddate > as_of:
-        return out  # unknown or not yet delivered — can't require docs
+    status = _status(ditat)
+    if status in {"cancelled", "canceled"}:
+        return out  # cancelled load was never delivered — missing docs expected
+    if status != "completed":
+        # No/unknown status → fall back to the delivery-date proxy.
+        if as_of is None:
+            return out
+        ddate = delivery_date(ditat)
+        if ddate is None or ddate > as_of:
+            return out  # not yet delivered — can't require docs
     missing = extracted.get("docs_missing") if isinstance(extracted, dict) else None
     if not missing:
         return out
