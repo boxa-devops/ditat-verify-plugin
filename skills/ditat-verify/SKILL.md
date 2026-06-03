@@ -193,8 +193,10 @@ to the Ditat trip (shipment) dates. For SH-…688-type cases where the BOL/POD s
 is unreadable, use the Ditat dates rather than leaving them blank.
 - These dates often appear **inline inside the Shipper/Consignee block**, e.g.
   `Pickup: Jun 2, 2026 · 08:00-15:00` and `Delivery: Jun 3, 2026 · 08:00` — not as
-  a labeled column. Capture them. The parser handles trailing times/separators
-  (`Jun 3, 2026 · 08:00`, `06/03/2026`, ISO), so the raw string is fine.
+  a labeled column. Capture them.
+- **YOU normalize the date — always emit ISO `YYYY-MM-DD`.** Convert at extraction
+  time: `Jun 3, 2026 · 08:00` → `"2026-06-03"`, `06/03/2026` → `"2026-06-03"`.
+  Don't pass the raw string through; the LLM (you) owns this, not Python.
 
 **Page completeness (`pages_present` / `pages_expected`) — per BOL and POD.**
 If the document says "Page 1 of 11", set `pages_expected: 11`. Set
@@ -217,7 +219,8 @@ as 1 page — all pages must be present). Omit both keys if there's no "of N" ma
 Rules:
 - **Do NOT diff in your head.** `finalize` runs the deterministic diff in Python. Just extract cleanly.
 - If a doc is missing/unreadable, omit that key from `extracted` and add the type to `docs_missing` (e.g. `["RC"]`). Don't retry unreadable PDFs.
-- ISO dates (`YYYY-MM-DD`) where possible.
+- **Dates: always ISO `YYYY-MM-DD`.** You convert messy formats during extraction
+  (see the pickup/delivery note above) — never emit raw "Jun 3, 2026 · 08:00".
 - Read only page 1 of each PDF unless it's clearly multi-page (RC sometimes splits).
 
 ### Step 4 — Finalize (one helper call)
