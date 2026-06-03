@@ -333,12 +333,17 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     all_records: list[dict] = batch_doc.get("shipments") or []
     findings_list: list[dict] = findings_doc.get("shipments") or []
 
-    # We only verify DELIVERED shipments. Drop any whose delivery date is still
-    # in the future — they're not done and their docs aren't due yet.
+    # We verify DELIVERED, non-skipped shipments only. Drop future-delivery loads
+    # (not done yet) and skip-list customers (e.g. Amazon — not our process).
     batch_records: list[dict] = []
     skipped_pending = 0
+    skipped_customer = 0
     for entry in all_records:
-        if diff_mod.is_pending(entry.get("ditat_fields") or {}, as_of):
+        ditat = entry.get("ditat_fields") or {}
+        if diff_mod.is_skipped_customer(ditat, rules):
+            skipped_customer += 1
+            continue
+        if diff_mod.is_pending(ditat, as_of):
             skipped_pending += 1
             continue
         batch_records.append(entry)
@@ -391,6 +396,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         "docx": str(out_path.resolve()),
         "processed": counters["shipments"],
         "skipped_pending": skipped_pending,
+        "skipped_customer": skipped_customer,
         "problematic": counters["problematic"],
         "verdicts": counters["verdicts"],
         "problem_shipments": problem_rows,

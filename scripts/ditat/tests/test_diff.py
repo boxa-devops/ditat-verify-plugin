@@ -228,6 +228,51 @@ class TestVerdicts(unittest.TestCase):
         r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=_BOL_OK, pod=pod))
         self.assertTrue(any(f["field"] == "damages_notes" for f in r["warn"]))
 
+    def test_bol_rc_bol_number_not_compared(self):
+        bol = dict(_BOL_OK, bol_number="AAA")
+        rc = dict(_RC_OK, bol_number="ZZZ")
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=bol, pod=_POD_OK))
+        self.assertFalse(any(f["pair"] == "BOL↔RC" and f["field"] == "bol_number"
+                             for f in r["critical"] + r["warn"]))
+
+    def test_ditat_rc_equipment_not_compared(self):
+        rc = dict(_RC_OK, equipment_type="Box Truck")  # very different from Reefer
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=_POD_OK))
+        self.assertFalse(any(f["pair"] == "Ditat↔RC" and f["field"] == "equipment_type"
+                             for f in r["critical"] + r["warn"]))
+
+    def test_commodity_like_shares_word_is_not_flagged(self):
+        bol = dict(_BOL_OK, commodity="Coffee closures / food grade packaging")
+        rc = dict(_RC_OK, commodity="Packaging Materials")
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=bol, pod=_POD_OK))
+        self.assertFalse(any(f["pair"] == "BOL↔RC" and f["field"] == "commodity"
+                             for f in r["warn"]))
+
+    def test_commodity_unrelated_is_warn(self):
+        bol = dict(_BOL_OK, commodity="Electronics")
+        rc = dict(_RC_OK, commodity="Frozen Beef")
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=bol, pod=_POD_OK))
+        self.assertTrue(any(f["pair"] == "BOL↔RC" and f["field"] == "commodity"
+                            for f in r["warn"]))
+
+    def test_incomplete_pages_is_critical(self):
+        bol = dict(_BOL_OK, pages_expected=11, pages_present=1)
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
+        self.assertTrue(any(f["pair"] == "Docs" and f["field"] == "BOL pages"
+                            for f in r["critical"]))
+
+    def test_complete_pages_no_flag(self):
+        bol = dict(_BOL_OK, pages_expected=2, pages_present=2)
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
+        self.assertFalse(any(f["pair"] == "Docs" and f["field"] == "BOL pages"
+                             for f in r["critical"]))
+
+    def test_is_skipped_customer_amazon(self):
+        self.assertTrue(diff.is_skipped_customer({"customer": "Amazon Logistics"},
+                                                 diff.default_rules()))
+        self.assertFalse(diff.is_skipped_customer({"customer": "Walmart Inc"},
+                                                  diff.default_rules()))
+
 
 from datetime import date  # noqa: E402
 

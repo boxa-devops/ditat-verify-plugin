@@ -153,11 +153,12 @@ Chunk file schema (list form):
                "pickup_date": "...", "delivery_date": "...",
                "shipper":   { "city": "...", "state": "..." },
                "consignee": { "city": "...", "state": "..." },
-               "commodity": "..." },
+               "commodity": "...", "pages_present": 11, "pages_expected": 11 },
       "pod": { "bol_number": "...", "delivery_date": "...", "signed_by": "...",
                "pieces_received": 24, "weight_received_lbs": 41950,
                "damages_notes": null,
-               "arrival_time": "08:00", "departure_time": "12:30" }
+               "arrival_time": "08:00", "departure_time": "12:30",
+               "pages_present": 1, "pages_expected": 1 }
     },
     "docs_missing": []
   }
@@ -174,16 +175,26 @@ The helper merges atomically (last-write-wins per shipment_key). The skeleton's 
 | agreed_rate                     | shipper {city, state}          | delivery_date        |
 | pickup_date                     | consignee {city, state}        | signed_by            |
 | delivery_date                   | pickup_date                    | pieces_received      |
-| equipment_type                  | delivery_date                  | weight_received_lbs  |
-| pickup_location {city, state}   | weight_lbs                     | damages_notes        |
-| delivery_location {city, state} | pieces                         | **arrival_time**     |
-| commodity                       | commodity, po_numbers, hazmat  | **departure_time**   |
-| weight_lbs, pieces              |                                |                      |
-| detention_rate ($/hr)           |                                |                      |
+| pickup_location {city, state}   | delivery_date                  | weight_received_lbs  |
+| delivery_location {city, state} | weight_lbs                     | damages_notes        |
+| commodity                       | pieces                         | **arrival_time**     |
+| weight_lbs, pieces              | commodity, po_numbers, hazmat  | **departure_time**   |
+| detention_rate ($/hr)           | **pages_present/expected**     | **pages_present/expected** |
 | detention_free_hrs              |                                |                      |
 | detention_max_hrs               |                                |                      |
 | layover_rate ($/24h)            |                                |                      |
 | layover_threshold_hrs           |                                |                      |
+
+**Pickup / delivery dates — source priority: POD → BOL → Ditat trip.** Take the
+actual pickup/delivery date from the POD if present, else the BOL, else fall back
+to the Ditat trip (shipment) dates. For SH-…688-type cases where the BOL/POD scan
+is unreadable, use the Ditat dates rather than leaving them blank.
+
+**Page completeness (`pages_present` / `pages_expected`) — per BOL and POD.**
+If the document says "Page 1 of 11", set `pages_expected: 11`. Set
+`pages_present` to how many pages the uploaded PDF actually has. The diff flags a
+**critical** when `pages_expected > pages_present` (e.g. an 11-page BOL uploaded
+as 1 page — all pages must be present). Omit both keys if there's no "of N" marker.
 
 **POD in/out times (drive accessorial detection):**
 - `arrival_time` / `departure_time` — the in/out (check-in / check-out) times stamped on the delivery receipt. Accept `HH:MM`, `H:MM AM/PM`, or full ISO datetime. Omit if the POD doesn't show them.
@@ -221,25 +232,30 @@ The helper:
 
 | Pair          | Field                          | Rule (default)                                                         |
 |---------------|--------------------------------|------------------------------------------------------------------------|
-| Docs          | RC / BOL / POD                 | **delivered** shipment missing any of RC/BOL/POD → critical (RC exempt for `rc_missing_ok_customers`). Pending loads excluded upstream. |
+| Docs          | RC / BOL / POD                 | **delivered** shipment missing any of RC/BOL/POD → critical (RC exempt for `rc_missing_ok_customers`). Pending + `skip_customers` (Amazon) excluded upstream. |
+| Docs          | pages                          | BOL/POD `pages_expected > pages_present` (e.g. "1 of 11" but 1 uploaded) → critical |
 | RC-policy     | detention                      | RC states detention terms → accepted (no flag). RC silent **and** POD in/out wait > 2h free → critical |
 | RC-policy     | layover                        | RC states layover terms → accepted (no flag). RC silent **and** POD in/out wait ≥ 5h → critical |
 | BOL↔RC        | weight_lbs                     | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |
 | BOL↔RC        | pieces                         | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |
-| BOL↔RC        | bol_number                     | id mismatch → critical                                                 |
 | BOL↔RC        | dates                          | Δ > 1d → critical; Δ = 1d → warn                                       |
-| BOL↔RC        | commodity / locations          | normalized string compare; mismatch → warn (fuzzy → info)              |
+| BOL↔RC        | commodity                      | **lenient "like" compare** — match if one contains the other or they share a meaningful word; only fully unrelated → warn |
+| BOL↔RC        | locations                      | normalized string compare; mismatch → warn (fuzzy → info)              |
 | POD↔RC        | delivery_date                  | Δ > 1d → critical; Δ = 1d → warn                                       |
-| POD↔RC        | bol_number                     | **skipped when BOL doc present** — BOL↔RC and BOL↔POD cover it         |
+| POD↔RC        | bol_number                     | **skipped when BOL doc present** — BOL↔POD covers it                   |
 | POD↔RC        | weight_received, pieces_received | **dropped** — POD quantities diverge on partial deliveries           |
 | POD↔RC        | damages_notes                  | any damages → warn                                                     |
-| Ditat↔RC      | total_weight_lbs               | weight Δ > 5% → critical; ≥1% → warn                                   |
-| Ditat↔RC      | total_pieces                   | any diff → critical                                                    |
-| Ditat↔RC      | bol_number, load_number        | id mismatch → critical                                                 |
-| Ditat↔RC      | equipment_type                 | normalized string compare                                              |
-| Ditat↔RC      | pickup_location, delivery_location | city + state only via normalized compare; full address not required |
+| Ditat↔RC      | total_weight_lbs               | weight Δ > 5% → critical; ≥1% → warn (Ditat 0/empty → warn "not entered") |
+| Ditat↔RC      | total_pieces                   | any diff → critical (Ditat 0/empty → warn "not entered")              |
+| Ditat↔RC      | load_number                    | id mismatch → critical                                                 |
+| Ditat↔RC      | pickup_location, delivery_location | city + state only via normalized compare                          |
 | Ditat↔RC      | revenue_vs_rate                | money Δ > $1 → critical                                                |
 | BOL↔POD       | bol_number                     | id mismatch → critical (weight + pieces dropped — POD unreliable)      |
+
+**Not compared** (intentionally removed — produced noise, no value):
+- BOL↔RC `bol_number` — the RC carries no BOL number.
+- Ditat↔RC `bol_number`, `equipment_type` — RC has no BOL number; "53Van" vs "Dry Van 53'" is the same trailer.
+- **Amazon loads** (`skip_customers`) — excluded entirely; not our process.
 
 **Special-case verdict:**
 - RC missing **and** customer name matches an entry in `rc_missing_ok_customers` (default: `amazon`) → verdict downgraded from `RC MISSING` to `OK`.

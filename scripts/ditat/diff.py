@@ -220,6 +220,35 @@ def _cmp_str(a: Any, b: Any, severity_on_diff: str = WARN) -> tuple[str, str] | 
     return (severity_on_diff, "mismatch")
 
 
+# Generic words that don't help tell two commodity descriptions apart.
+_COMMODITY_STOP = {
+    "and", "of", "the", "grade", "material", "materials", "product", "products",
+    "general", "freight", "misc", "goods", "items", "food", "for", "with",
+}
+
+
+def _cmp_commodity(a: Any, b: Any) -> tuple[str, str] | None:
+    """Lenient 'like statement' compare for commodity descriptions.
+
+    Carriers and brokers describe the same freight differently
+    ("Coffee closures / food grade packaging" vs "Packaging Materials"). Treat
+    them as matching when one contains the other OR they share any meaningful
+    word; only flag (warn) when there's no overlap at all.
+    """
+    na, nb = _norm_str(a), _norm_str(b)
+    if na is None and nb is None:
+        return None
+    if na is None or nb is None:
+        return (INFO, "missing on one side")  # commodity is informational, never a hard flag
+    if na == nb or na in nb or nb in na:
+        return (INFO, "like")
+    ta = {w for w in re.split(r"[^a-z0-9]+", na) if len(w) >= 3 and w not in _COMMODITY_STOP}
+    tb = {w for w in re.split(r"[^a-z0-9]+", nb) if len(w) >= 3 and w not in _COMMODITY_STOP}
+    if ta & tb:
+        return (INFO, "like")
+    return (WARN, "unrelated")
+
+
 def _cmp_ditat_qty(a: Any, b: Any, inner) -> tuple[str, str] | None:
     """Ditat↔RC weight/pieces: some tenants never enter these in Ditat, so a
     Ditat 0/None isn't a real discrepancy — it's a not-entered field. Downgrade
@@ -298,8 +327,7 @@ def diff_bol_rc(bol: Optional[dict], rc: Optional[dict], rules: dict) -> list[di
                     threshold_pct=rules["bol_rc_overage"]["weight_threshold_pct"])
     cmp_p = partial(_cmp_overage_int,
                     threshold_pct=rules["bol_rc_overage"]["pieces_threshold_pct"])
-    _emit(out, pair, "bol_number",
-          _doc_get(bol, "bol_number"), _doc_get(rc, "bol_number"), _cmp_id)
+    # bol_number intentionally NOT compared here — the RC does not carry a BOL number.
     _emit(out, pair, "pickup_date",
           _doc_get(bol, "pickup_date"), _doc_get(rc, "pickup_date"), cmp_date)
     _emit(out, pair, "delivery_date",
@@ -309,7 +337,7 @@ def diff_bol_rc(bol: Optional[dict], rc: Optional[dict], rules: dict) -> list[di
     _emit(out, pair, "pieces",
           _doc_get(bol, "pieces"), _doc_get(rc, "pieces"), cmp_p)
     _emit(out, pair, "commodity",
-          _doc_get(bol, "commodity"), _doc_get(rc, "commodity"), cmp_str)
+          _doc_get(bol, "commodity"), _doc_get(rc, "commodity"), _cmp_commodity)
     _emit(out, pair, "pickup_location",
           _city_state(_doc_get(bol, "shipper", "pickup")),
           _city_state(_doc_get(rc, "pickup_location", "pickup")), cmp_str)
@@ -366,8 +394,8 @@ def diff_ditat_rc(ditat: Optional[dict], rc: Optional[dict], rules: dict) -> lis
     _emit(out, pair, "total_pieces",
           ditat.get("total_pieces"), _doc_get(rc, "pieces"),
           partial(_cmp_ditat_qty, inner=_cmp_int))
-    _emit(out, pair, "equipment_type",
-          ditat.get("equipment_type"), _doc_get(rc, "equipment_type"), cmp_str)
+    # equipment_type intentionally NOT compared — "53Van" vs "Dry Van 53'" etc are
+    # the same trailer in different words; produced noise with no value.
     _emit(out, pair, "pickup_location",
           _city_state(ditat.get("pickup")),
           _city_state(_doc_get(rc, "pickup_location", "pickup")), cmp_str)
@@ -499,6 +527,38 @@ def _rc_exempt(ditat: Optional[dict], rules: dict) -> bool:
     return bool(customer and any(c.lower() in customer for c in ok_customers))
 
 
+def is_skipped_customer(ditat: Optional[dict], rules: dict) -> bool:
+    """True when the shipment's customer is on the skip list (e.g. Amazon) —
+    those loads are not verified at all."""
+    customer = _norm_str(ditat.get("customer") if isinstance(ditat, dict) else None)
+    skip = rules.get("skip_customers") or []
+    return bool(customer and any(c.lower() in customer for c in skip))
+
+
+def diff_doc_pages(extracted: dict) -> list[dict]:
+    """A document uploaded with fewer pages than it declares ("Page 1 of 11" but
+    only 1 page present) is incomplete → critical. The agent records
+    `pages_expected` (the "of N") and `pages_present` (pages actually in the PDF).
+    """
+    out: list[dict] = []
+    if not isinstance(extracted, dict):
+        return out
+    for doc in ("rc", "bol", "pod"):
+        d = extracted.get(doc)
+        if not isinstance(d, dict):
+            continue
+        exp = _to_int(d.get("pages_expected"))
+        pres = _to_int(d.get("pages_present"))
+        if exp and pres and exp > pres:
+            out.append({
+                "pair": "Docs", "field": f"{doc.upper()} pages",
+                "a": f"{pres} uploaded", "b": f"{exp} expected",
+                "severity": CRIT,
+                "message": "incomplete document — not all pages uploaded",
+            })
+    return out
+
+
 def diff_doc_completeness(ditat: Optional[dict], extracted: dict, rules: dict,
                           as_of: Optional[date]) -> list[dict]:
     """A DELIVERED shipment must have its docs. Missing RC/BOL/POD → critical.
@@ -547,6 +607,7 @@ def run_diff(ditat: dict, extracted: dict, rules: Optional[dict] = None,
 
     findings: list[dict] = []
     findings.extend(diff_doc_completeness(ditat, extracted, rules, as_of))
+    findings.extend(diff_doc_pages(extracted))
     findings.extend(diff_rc_policy(rc, pod, rules))
     findings.extend(diff_bol_rc(bol, rc, rules))
     findings.extend(diff_pod_rc(pod, rc, rules, bol))

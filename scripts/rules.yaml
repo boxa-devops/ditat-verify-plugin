@@ -44,3 +44,8 @@ accessorial:
 # Matched as a case-insensitive substring of the Ditat customer name.
 rc_missing_ok_customers:
   - amazon
+
+# Customers whose loads are NOT verified at all — excluded from the report.
+# (Amazon runs its own process; we don't check those.)
+skip_customers:
+  - amazon

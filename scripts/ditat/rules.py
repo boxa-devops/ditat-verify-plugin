@@ -36,6 +36,8 @@ DEFAULTS: dict[str, Any] = {
         },
     },
     "rc_missing_ok_customers": ["amazon"],
+    # Customers whose loads are NOT verified at all (excluded from the report).
+    "skip_customers": ["amazon"],
 }
 
 
