@@ -332,7 +332,7 @@ SH-0000009586      RC MISSING    0         1
 - `verify last week` → `pull --last-week`, full flow
 - `verify last month` / `verify ditat shipments` → `pull --last-month`, full flow
 - `verify next N shipments` → `pull --limit N`, full flow
-- `verify shipment <ID>` / `check shipment <ID>` → `verify-one <ID>` — fetches just that shipment (no window/status/delivered/skip filters), then the same extract → finalize flow. Accepts **either** the numeric Ditat key (`9653`) **or** the display id (`SH-0000009716`) — the server resolves the id to the key (scans the last 180 days).
+- `verify shipment <KEY>` / `check shipment <KEY>` → `verify-one <KEY>` — fetches just that shipment (no window/status/delivered/skip filters), then the same extract → finalize flow. Use the **numeric Ditat key** (e.g. `9653`), not the `SH-…` display id.
 - `ditat server check` → `check-server`
 
 ## Operational notes
