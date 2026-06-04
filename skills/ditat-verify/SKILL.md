@@ -245,7 +245,8 @@ The helper:
 1. Loads thresholds from `rules.yaml` (falls back to built-in defaults if absent).
 2. Runs cross-checks with the rules below.
 3. Builds **one `.docx`** with counts header + detail section for problematic shipments only.
-4. Cleans every per-run intermediate (downloads/, sidecar, findings, chunk files), leaving only `reports/`. Pass `--keep-intermediates` to retain them.
+4. **Sends the summary + the .docx to Telegram** when `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` are set (the bot must be an admin/member of the channel/group). Suppress with `--no-telegram`.
+5. Cleans every per-run intermediate (downloads/, sidecar, findings, chunk files), leaving only `reports/`. Pass `--keep-intermediates` to retain them.
 
 **Cross-check rules** (defaults — all tunable in `rules.yaml`):
 

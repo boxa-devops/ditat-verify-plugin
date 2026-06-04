@@ -30,6 +30,7 @@ from pathlib import Path
 
 from ditat import diff as diff_mod
 from ditat import rules as rules_mod
+from ditat import telegram
 from ditat.docx_report import build_batch_docx
 from ditat.logging_utils import setup_logging
 from ditat.remote import ServerConfig, download_docs, fetch_batch, fetch_one
@@ -420,6 +421,13 @@ def cmd_finalize(args: argparse.Namespace) -> int:
                 "warn":         d.get("warn_count", 0),
             })
 
+    # Telegram delivery (summary + docx) when configured, unless suppressed.
+    telegram_status = {"sent": False, "reason": "disabled"}
+    if not args.no_telegram and telegram.is_configured():
+        summary = _telegram_summary(out_path, counters, problem_rows,
+                                    skipped_pending, skipped_customer)
+        telegram_status = telegram.send_report(summary, out_path)
+
     cleaned = [] if args.keep_intermediates else _cleanup_intermediates(batch_path, findings_path)
 
     print(json.dumps({
@@ -431,9 +439,35 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         "verdicts": counters["verdicts"],
         "problem_shipments": problem_rows,
         "cleaned": len(cleaned),
+        "telegram": telegram_status,
     }, indent=2))
 
     return 0
+
+
+def _telegram_summary(docx_path: Path, counters: dict, problem_rows: list[dict],
+                      skipped_pending: int, skipped_customer: int) -> str:
+    v = counters.get("verdicts") or {}
+    lines = [
+        "<b>Ditat Verification Report</b>",
+        f"Shipments: {counters.get('shipments', 0)}  ·  "
+        f"OK {v.get('OK', 0)} · WARN {v.get('WARN', 0)} · "
+        f"ISSUES {v.get('ISSUES', 0)} · RC MISSING {v.get('RC MISSING', 0)}",
+    ]
+    if skipped_pending or skipped_customer:
+        lines.append(f"Skipped: {skipped_pending} pending, {skipped_customer} customer")
+    if problem_rows:
+        lines.append(f"\n<b>Problems ({len(problem_rows)}):</b>")
+        for r in problem_rows[:25]:
+            who = r.get("shipment_id") or r.get("shipment_key")
+            lines.append(f"• {who} — {r.get('verdict')} "
+                         f"({r.get('critical', 0)} crit / {r.get('warn', 0)} warn)")
+        if len(problem_rows) > 25:
+            lines.append(f"…and {len(problem_rows) - 25} more")
+    else:
+        lines.append("\n✅ No problems found.")
+    lines.append(f"\n📄 {docx_path.name}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- main
@@ -475,6 +509,8 @@ def main() -> int:
     fz.add_argument("--keep-intermediates", action="store_true",
                     help="Keep downloads/, sidecar, findings, and chunk files. "
                          "Default: delete them after success, leaving only reports/.")
+    fz.add_argument("--no-telegram", action="store_true",
+                    help="Don't send the report to Telegram even if configured.")
     fz.add_argument("--anomalies-only", action="store_true", default=True,
                     help="Docx contains only problematic shipments + counts header. Default: on.")
     fz.add_argument("--full-report", dest="anomalies_only", action="store_false",
