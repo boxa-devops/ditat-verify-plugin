@@ -1,6 +1,6 @@
 {
   "name": "ditat-verify",
-  "version": "0.2.12",
+  "version": "0.2.13",
   "description": "Pull unprocessed Ditat TMS shipments, download BOL/POD/Rate-Confirmation PDFs, cross-check fields against the Rate Confirmation and Ditat shipment record, emit ONE anomalies-only batch .docx. Big-chunk parallel pipeline (10 shipments/turn) driven by helper CLI subcommands.",
   "author": { "name": "Ditat ops", "email": "boxa.devops@gmail.com" },
   "license": "Proprietary",

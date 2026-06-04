@@ -32,7 +32,7 @@ from ditat import diff as diff_mod
 from ditat import rules as rules_mod
 from ditat.docx_report import build_batch_docx
 from ditat.logging_utils import setup_logging
-from ditat.remote import ServerConfig, download_docs, fetch_batch
+from ditat.remote import ServerConfig, download_docs, fetch_batch, fetch_one
 
 log = logging.getLogger("ditat")
 
@@ -110,11 +110,12 @@ def _cleanup_intermediates(batch_path: Path, findings_path: Path) -> list[str]:
     return removed
 
 
-def _write_sidecar(records: list[dict]) -> None:
+def _write_sidecar(records: list[dict], forced: bool = False) -> None:
     BATCH_SIDECAR.parent.mkdir(parents=True, exist_ok=True)
     BATCH_SIDECAR.write_text(json.dumps({
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "count": len(records),
+        "forced": forced,
         "shipments": records,
     }, default=str, indent=2), encoding="utf-8")
 
@@ -238,6 +239,32 @@ def cmd_pull(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify_one(args: argparse.Namespace) -> int:
+    """Verify a single shipment by its Ditat key — bypasses window/status filters."""
+    config = ServerConfig()
+    ok, missing = config.validate()
+    if not ok:
+        print(json.dumps({"error": f"missing server config: {missing}"}), file=sys.stderr)
+        return 2
+
+    manifest = fetch_one(config, args.shipment_key)
+    if not manifest.get("shipments"):
+        print(json.dumps({"error": f"shipment {args.shipment_key} not found"}), file=sys.stderr)
+        return 1
+
+    records = download_docs(config, manifest, DOWNLOAD_DIR)
+    _write_sidecar(records, forced=True)
+    _write_findings(_findings_skeleton(records))
+
+    print(json.dumps({
+        "count": len(records),
+        "batch_sidecar": str(BATCH_SIDECAR.resolve()),
+        "findings_file": str(FINDINGS_FILE.resolve()),
+        "shipments": [_slim_for_stdout(r) for r in records],
+    }, default=str, indent=2))
+    return 0
+
+
 def cmd_append_findings(args: argparse.Namespace) -> int:
     """Merge a chunk's extracted records into `.ditat_findings.json`.
 
@@ -335,15 +362,18 @@ def cmd_finalize(args: argparse.Namespace) -> int:
 
     # We verify DELIVERED, non-skipped shipments only. Drop future-delivery loads
     # (not done yet) and skip-list customers (e.g. Amazon — not our process).
+    # A `forced` batch (verify-one) bypasses these filters — verify exactly what
+    # was requested.
+    forced = bool(batch_doc.get("forced"))
     batch_records: list[dict] = []
     skipped_pending = 0
     skipped_customer = 0
     for entry in all_records:
         ditat = entry.get("ditat_fields") or {}
-        if diff_mod.is_skipped_customer(ditat, rules):
+        if not forced and diff_mod.is_skipped_customer(ditat, rules):
             skipped_customer += 1
             continue
-        if diff_mod.is_pending(ditat, as_of):
+        if not forced and diff_mod.is_pending(ditat, as_of):
             skipped_pending += 1
             continue
         batch_records.append(entry)
@@ -430,6 +460,10 @@ def main() -> int:
     pl.add_argument("--require-docs", action="store_true", default=True)
     pl.add_argument("--page-size", type=int, default=1000)
     pl.set_defaults(func=cmd_pull)
+
+    vo = sub.add_parser("verify-one", help="Verify ONE shipment by Ditat key (no filters)")
+    vo.add_argument("shipment_key", help="Ditat shipment key (numeric, e.g. 9653)")
+    vo.set_defaults(func=cmd_verify_one)
 
     fz = sub.add_parser("finalize",
                         help="Diff + render docx from agent findings + batch sidecar")

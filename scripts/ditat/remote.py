@@ -76,6 +76,16 @@ def fetch_batch(config: ServerConfig, *, since_days: int = 30, last_week: bool =
     return resp.json()
 
 
+def fetch_one(config: ServerConfig, shipment_key: str) -> dict:
+    """POST /shipment/{key} → manifest for one shipment (no window/status filters)."""
+    url = f"{config.base_url}/shipment/{shipment_key}"
+    log.info("POST %s", url)
+    resp = requests.post(url, headers=config._headers(), timeout=300)
+    if resp.status_code != 200:
+        raise RuntimeError(f"server /shipment returned {resp.status_code}: {resp.text[:300]}")
+    return resp.json()
+
+
 def download_docs(config: ServerConfig, manifest: dict, out_root: Path) -> list[dict]:
     """Download every doc in the manifest to disk; return enriched batch records.
 
