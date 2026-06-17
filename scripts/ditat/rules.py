@@ -20,20 +20,11 @@ DEFAULTS: dict[str, Any] = {
     "bol_rc_overage": {"weight_threshold_pct": 10.0, "pieces_threshold_pct": 10.0},
     "money": {"critical_abs": 1.0, "critical_pct": 1.0},
     "date": {"critical_days": 1},
-    "string_mismatch_severity": "warn",
+    # Only these two are read — they detect an unbilled accessorial when the RC
+    # is silent but the POD's in/out times show the wait occurred (see diff.py).
     "accessorial": {
-        "detention_rate": 50.0,
         "detention_free_hrs": 2.0,
-        "detention_max_hrs": 5.0,
-        "layover_rate": 250.0,
         "layover_threshold_hrs": 5.0,
-        "severities": {
-            "detention_rate": "critical",
-            "detention_free_hrs": "critical",
-            "detention_max_hrs": "warn",
-            "layover_rate": "critical",
-            "layover_threshold_hrs": "warn",
-        },
     },
     "rc_missing_ok_customers": ["amazon"],
     # Customers whose loads are NOT verified at all (excluded from the report).

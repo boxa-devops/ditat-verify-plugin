@@ -18,7 +18,6 @@ from dotenv import load_dotenv
 log = logging.getLogger("ditat")
 
 _DOWNLOAD_RETRIES = 2
-_DOC_WORKERS = 4
 
 
 class ServerConfig:
