@@ -71,15 +71,15 @@ class TestVerdicts(unittest.TestCase):
         r = diff.run_diff(_DITAT_OK, _shipment(bol=_BOL_OK, pod=_POD_OK))
         self.assertEqual(r["verdict"], "RC MISSING")
 
-    def test_bol_weight_10pct_over_rc_is_critical(self):
-        bol = dict(_BOL_OK, weight_lbs=44000)  # bol > rc by 10%
+    def test_bol_weight_40pct_over_rc_is_critical(self):
+        bol = dict(_BOL_OK, weight_lbs=56000)  # bol > rc by 40% (> 30% threshold)
         r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
         self.assertEqual(r["verdict"], "ISSUES")
         self.assertTrue(any(f["field"] == "weight_lbs" and f["pair"] == "BOL↔RC"
                             for f in r["critical"]))
 
-    def test_bol_weight_2pct_over_rc_is_ok(self):
-        bol = dict(_BOL_OK, weight_lbs=40800)  # bol > rc by 2% — below 10% threshold
+    def test_bol_weight_25pct_over_rc_is_ok(self):
+        bol = dict(_BOL_OK, weight_lbs=50000)  # bol > rc by 25% — below 30% threshold
         r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
         self.assertEqual(r["verdict"], "OK")
 
@@ -114,6 +114,20 @@ class TestVerdicts(unittest.TestCase):
         r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=_BOL_OK, pod=pod))
         self.assertEqual(r["verdict"], "WARN")
         self.assertTrue(any(f["field"] == "delivery_date" for f in r["warn"]))
+
+    def test_delivery_early_is_not_flagged(self):
+        # Delivered a day BEFORE the RC appointment → beating schedule, no flag.
+        pod = dict(_POD_OK, delivery_date="2026-05-02")  # RC delivery = 05-03
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=_BOL_OK, pod=pod))
+        self.assertEqual(r["verdict"], "OK")
+        self.assertFalse(any(f["field"] == "delivery_date"
+                             for f in r["critical"] + r["warn"]))
+
+    def test_delivery_3d_early_is_not_flagged(self):
+        pod = dict(_POD_OK, delivery_date="2026-04-30")  # 3d before RC 05-03
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=_BOL_OK, pod=pod))
+        self.assertFalse(any(f["field"] == "delivery_date"
+                             for f in r["critical"] + r["warn"]))
 
     def test_money_2_dollar_diff_is_critical(self):
         rc = dict(_RC_OK, agreed_rate=1503.00)
@@ -207,6 +221,22 @@ class TestVerdicts(unittest.TestCase):
         r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=pod))
         self.assertFalse(any(f["pair"] == "RC-policy"
                              for f in r["critical"] + r["warn"]))
+
+    def test_minor_overrun_within_grace_not_detention(self):
+        # 2h20m wait = 20 min past 2h free — within the 30 min grace → not detention.
+        rc = {k: v for k, v in _RC_OK.items() if not k.startswith("detention_")}
+        pod = dict(_POD_OK, arrival_time="08:00", departure_time="10:20")  # 2.33h
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=pod))
+        self.assertFalse(any(f["pair"] == "RC-policy" and f["field"] == "detention"
+                             for f in r["critical"] + r["warn"]))
+
+    def test_overrun_past_grace_is_detention(self):
+        # 2h40m = 40 min past free, beyond the 30 min grace → detention critical.
+        rc = {k: v for k, v in _RC_OK.items() if not k.startswith("detention_")}
+        pod = dict(_POD_OK, arrival_time="08:00", departure_time="10:40")  # 2.67h
+        r = diff.run_diff(_DITAT_OK, _shipment(rc=rc, bol=_BOL_OK, pod=pod))
+        self.assertTrue(any(f["pair"] == "RC-policy" and f["field"] == "detention"
+                            for f in r["critical"]))
 
     def test_rc_silent_layover_but_long_wait_is_critical(self):
         rc = {k: v for k, v in _RC_OK.items() if not k.startswith("layover_")}
@@ -382,6 +412,28 @@ class TestDeliveryAndCompleteness(unittest.TestCase):
         ditat = dict(_DITAT_OK, status="Completed")
         ext = {"rc": _RC_OK, "docs_missing": ["BOL", "POD"]}
         r = diff.run_diff(ditat, ext)  # no as_of, no delivery date
+        self.assertTrue(any(f["pair"] == "Docs" and f["field"] == "BOL"
+                            for f in r["critical"]))
+
+    def test_tonu_completed_only_requires_rc(self):
+        # TONU load: no freight moved → BOL/POD not expected, only RC.
+        ditat = dict(_DITAT_OK, status="Completed", payment_type="TONU")
+        ext = {"rc": _RC_OK, "docs_missing": ["BOL", "POD"]}
+        r = diff.run_diff(ditat, ext, as_of=_AS_OF)
+        self.assertFalse(any(f["pair"] == "Docs" and f["field"] in ("BOL", "POD")
+                             for f in r["critical"]))
+
+    def test_tonu_still_requires_rc(self):
+        ditat = dict(_DITAT_OK, status="Completed", payment_type="TONU")
+        ext = {"docs_missing": ["RC", "BOL", "POD"]}
+        r = diff.run_diff(dict(ditat, customer="Walmart"), ext, as_of=_AS_OF)
+        self.assertTrue(any(f["pair"] == "Docs" and f["field"] == "RC"
+                            for f in r["critical"]))
+
+    def test_non_tonu_completed_still_requires_bol_pod(self):
+        ditat = dict(_DITAT_OK, status="Completed", payment_type="Flat Rate")
+        ext = {"rc": _RC_OK, "docs_missing": ["BOL", "POD"]}
+        r = diff.run_diff(ditat, ext, as_of=_AS_OF)
         self.assertTrue(any(f["pair"] == "Docs" and f["field"] == "BOL"
                             for f in r["critical"]))
 
