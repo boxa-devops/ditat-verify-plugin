@@ -218,12 +218,26 @@ as 1 page — all pages must be present). Omit both keys if there's no "of N" ma
   exceeds free hours and the **RC is silent** on detention/layover, it's flagged
   (see RC-policy rules). No in/out times → nothing detected.
 
+**`agreed_rate` = the RC all-in TOTAL, not the line-haul line.** The RC's RATE
+DETAILS usually lists Line Haul + accessorials (fuel, detention loading, tarp,
+etc.) and then a **Total**. Extract `agreed_rate` from that **Total** ("Total:
+$2,835.00"), NOT the Line Haul sub-line ($2,400.00). Ditat's `total_revenue` is
+the all-in figure, so comparing it against the line-haul-only number produces a
+false revenue mismatch. If the RC shows no explicit Total, sum the line items.
+
 **RC accessorial extraction notes (the RC governs):**
 - `detention_rate` — dollars per hour the carrier is paid for detention.
 - `detention_free_hrs` — free hours before detention starts (typical RC phrasing: "after N free hours").
 - `detention_max_hrs` — cap on detention hours (omit if RC says no cap).
 - `layover_rate` — dollars per 24-hour layover period.
 - `layover_threshold_hrs` — hours of waiting before layover triggers.
+- **Detention/layover terms are OFTEN buried in the SPECIAL INSTRUCTIONS free
+  text, not in a labeled RATE DETAILS line.** Read that block. E.g. "Loads with
+  appts pay detention after 4hrs ($35/hr. max:$210)" →
+  `detention_rate: 35`, `detention_free_hrs: 4`, `detention_max_hrs: 6` (210 ÷ 35).
+  A RATE DETAILS line like "Detention Loading … $35.00" is ALSO a detention term.
+  When you see any dollar-per-hour or free-hours language for detention/layover,
+  capture it — don't leave the keys blank and let the diff flag "RC silent".
 - Extract whatever terms the RC states — **when the RC states a detention/layover term it is the agreed contract and is NOT flagged**, even if below company defaults. If the RC is silent on a term, omit the key; it's only a problem when the POD shows the accessorial actually occurred.
 
 Rules:
@@ -252,13 +266,14 @@ The helper:
 
 | Pair          | Field                          | Rule (default)                                                         |
 |---------------|--------------------------------|------------------------------------------------------------------------|
-| Docs          | RC / BOL / POD                 | **delivered** shipment missing any of RC/BOL/POD → critical (RC exempt for `rc_missing_ok_customers`). Pending + `skip_customers` (Amazon) excluded upstream. |
+| Docs          | RC / BOL / POD                 | **delivered** shipment missing any of RC/BOL/POD → critical (RC exempt for `rc_missing_ok_customers`; **BOL/POD exempt when Ditat `payment_type` is TONU** — no freight moved, only RC expected). Pending + `skip_customers` (Amazon) excluded upstream. |
 | Docs          | pages                          | BOL/POD `pages_expected > pages_present` (e.g. "1 of 11" but 1 uploaded) → critical |
-| RC-policy     | detention                      | RC states detention terms → accepted (no flag). RC silent **and** in/out wait (pickup or delivery) > 2h free → critical |
+| RC-policy     | detention                      | RC states detention terms → accepted (no flag). RC silent **and** in/out wait (pickup or delivery) > 2h free **+ 30 min grace** → critical (minor overrun ≤30 min past free = not detention) |
 | RC-policy     | layover                        | RC states layover terms → accepted (no flag). RC silent **and** in/out wait ≥ 5h → critical |
-| BOL↔RC        | weight_lbs                     | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |
+| BOL↔RC        | weight_lbs                     | bol ≤ rc → OK; bol > rc by **≥30%** → critical; below 30% → info (tolerated) |
 | BOL↔RC        | pieces                         | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |
-| Dates         | pickup_date, delivery_date     | resolved date **POD → BOL → Ditat trip** vs RC; Δ > 1d → critical; Δ = 1d → warn. Both sides must have a date (one-sided absence = no flag). |
+| Dates         | pickup_date                    | resolved date **POD → BOL → Ditat trip** vs RC; Δ > 1d → critical; Δ = 1d → warn. Both sides must have a date (one-sided absence = no flag). |
+| Dates         | delivery_date                  | **late-only** — actual (POD→BOL→Ditat) delivery vs RC appointment; late by >1d → critical, 1d → warn. **Early / on-time delivery is never flagged.** |
 | BOL↔RC        | commodity                      | **judged by YOU (LLM)** — set `commodity_mismatch: true` only when BOL & RC are genuinely different freight; relayed as a warn. Python does not compare commodity text. |
 | Location      | pickup_location, delivery_location | **judged by YOU (LLM)** — set `pickup_location_mismatch` / `delivery_location_mismatch` only when the route genuinely differs across docs; relayed as a warn. Python does not compare location text. |
 | POD↔RC        | bol_number                     | **skipped when BOL doc present** — BOL↔POD covers it                   |

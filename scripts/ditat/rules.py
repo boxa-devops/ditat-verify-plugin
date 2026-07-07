@@ -17,13 +17,15 @@ log = logging.getLogger("ditat")
 
 DEFAULTS: dict[str, Any] = {
     "weight_ditat_rc": {"critical_pct": 5.0, "warn_pct": 1.0},
-    "bol_rc_overage": {"weight_threshold_pct": 10.0, "pieces_threshold_pct": 10.0},
+    "bol_rc_overage": {"weight_threshold_pct": 30.0, "pieces_threshold_pct": 10.0},
     "money": {"critical_abs": 1.0, "critical_pct": 1.0},
     "date": {"critical_days": 1},
-    # Only these two are read — they detect an unbilled accessorial when the RC
-    # is silent but the POD's in/out times show the wait occurred (see diff.py).
+    # Read by diff.py to detect an unbilled accessorial when the RC is silent but
+    # the POD's in/out times show the wait occurred. `detention_grace_hrs` is a
+    # tolerance ABOVE free time — a minor overrun (≤ grace) isn't detention.
     "accessorial": {
         "detention_free_hrs": 2.0,
+        "detention_grace_hrs": 0.5,
         "layover_threshold_hrs": 5.0,
     },
     "rc_missing_ok_customers": ["amazon"],

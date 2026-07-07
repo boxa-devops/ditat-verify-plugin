@@ -214,6 +214,24 @@ def _cmp_date(a: Any, b: Any, critical_days: int = 1) -> tuple[str, str] | None:
     return (INFO, "match")
 
 
+def _cmp_date_late_only(a: Any, b: Any, critical_days: int = 1) -> tuple[str, str] | None:
+    """Delivery date vs RC — only a LATE delivery is a problem.
+
+    Delivering early or on time (actual ≤ RC) is fine and not flagged; the RC
+    date is a scheduled appointment, and beating it is never a service failure.
+    `a` = actual (POD→BOL→Ditat) date, `b` = RC scheduled date.
+    """
+    da, db = _to_date(a), _to_date(b)
+    if da is None or db is None:
+        return None
+    delta_days = (da - db).days
+    if delta_days <= 0:
+        return (INFO, "on time / early")
+    if delta_days > critical_days:
+        return (CRIT, f"{delta_days:+d}d late")
+    return (WARN, f"{delta_days:+d}d late")
+
+
 def _cmp_int(a: Any, b: Any) -> tuple[str, str] | None:
     ia, ib = _to_int(a), _to_int(b)
     if ia is None and ib is None:
@@ -500,12 +518,15 @@ def diff_rc_policy(rc: Optional[dict], pod: Optional[dict], bol: Optional[dict],
     has_detention = _to_float(_doc_get(rc, "detention_rate")) is not None
     has_layover = _to_float(_doc_get(rc, "layover_rate")) is not None
     free = pol["detention_free_hrs"]
+    grace = pol.get("detention_grace_hrs", 0.0)
     lay_thr = pol["layover_threshold_hrs"]
 
-    if wait > free and not has_detention:
+    # Grace period: a minor overrun past free time (≤ grace, e.g. 10–20 min) is
+    # not detention — only a wait beyond free + grace counts.
+    if wait > free + grace and not has_detention:
         out.append({
             "pair": pair, "field": "detention",
-            "a": f"{wait:.1f}h wait", "b": f"> {free:g}h free (default)",
+            "a": f"{wait:.1f}h wait", "b": f"> {free:g}h free +{grace * 60:g}m grace (default)",
             "severity": CRIT,
             "message": "detention occurred but RC silent on detention terms",
         })
@@ -557,14 +578,16 @@ def diff_dates(ditat: Optional[dict], extracted: dict, rc: Optional[dict],
     out: list[dict] = []
     if not rc:
         return out
-    cmp_date = partial(_rc_cmp,
-                       inner=partial(_cmp_date, critical_days=rules["date"]["critical_days"]))
+    crit_days = rules["date"]["critical_days"]
+    cmp_pickup = partial(_rc_cmp, inner=partial(_cmp_date, critical_days=crit_days))
+    # Delivery is late-only: beating the RC appointment (early/on-time) isn't a flag.
+    cmp_delivery = partial(_rc_cmp, inner=partial(_cmp_date_late_only, critical_days=crit_days))
     _emit(out, "Dates", "pickup_date",
           _resolve_trip_date(extracted, ditat, "pickup"),
-          _doc_get(rc, "pickup_date"), cmp_date)
+          _doc_get(rc, "pickup_date"), cmp_pickup)
     _emit(out, "Dates", "delivery_date",
           _resolve_trip_date(extracted, ditat, "delivery"),
-          _doc_get(rc, "delivery_date"), cmp_date)
+          _doc_get(rc, "delivery_date"), cmp_delivery)
     return out
 
 
@@ -603,6 +626,16 @@ def _rc_exempt(ditat: Optional[dict], rules: dict) -> bool:
     customer = _norm_str(ditat.get("customer") if isinstance(ditat, dict) else None)
     ok_customers = rules.get("rc_missing_ok_customers") or []
     return bool(customer and any(c.lower() in customer for c in ok_customers))
+
+
+def _is_tonu(ditat: Optional[dict]) -> bool:
+    """True when the load was billed as TONU (Truck Order Not Used).
+
+    A TONU load never physically moves freight, so there's no BOL or POD to
+    collect — only the RC. Detected from the Ditat revenue-line payment type.
+    """
+    pt = _norm_str(ditat.get("payment_type") if isinstance(ditat, dict) else None)
+    return bool(pt and ("tonu" in pt or "truck order not used" in pt))
 
 
 def is_skipped_customer(ditat: Optional[dict], rules: dict) -> bool:
@@ -660,11 +693,14 @@ def diff_doc_completeness(ditat: Optional[dict], extracted: dict, rules: dict,
     if not missing:
         return out
     rc_exempt = _rc_exempt(ditat, rules)
+    tonu = _is_tonu(ditat)
     for doc in ("RC", "BOL", "POD"):
         if doc not in missing:
             continue
         if doc == "RC" and rc_exempt:
             continue
+        if doc in ("BOL", "POD") and tonu:
+            continue  # TONU load moved no freight — only the RC is expected
         out.append({
             "pair": "Docs", "field": doc,
             "a": "(missing)", "b": "required (delivered)",

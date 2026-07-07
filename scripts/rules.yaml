@@ -11,7 +11,7 @@ weight_ditat_rc:
 
 # BOL vs RC overage — only flag when BOL EXCEEDS RC (under is fine).
 bol_rc_overage:
-  weight_threshold_pct: 10.0   # BOL weight over RC by ≥ this % → critical
+  weight_threshold_pct: 30.0   # BOL weight over RC by ≥ this % → critical (≤30% tolerated)
   pieces_threshold_pct: 10.0   # BOL pieces over RC by ≥ this % → critical
 
 # Revenue (Ditat) vs agreed rate (RC).
@@ -28,7 +28,8 @@ date:
 # are only the fallback used to DETECT an unbilled accessorial — when the RC is
 # silent AND the POD's in/out times show the wait occurred → critical.
 accessorial:
-  detention_free_hrs: 2.0       # wait beyond this (RC silent) → detention critical
+  detention_free_hrs: 2.0       # free hours before detention starts
+  detention_grace_hrs: 0.5      # tolerance above free time (RC silent) — ≤ this overrun (e.g. 30 min) is NOT detention
   layover_threshold_hrs: 5.0    # wait at/beyond this (RC silent) → layover critical
 
 # Customers for whom a missing RC is acceptable (verdict OK, not RC MISSING).
