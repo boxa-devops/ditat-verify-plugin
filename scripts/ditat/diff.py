@@ -131,55 +131,22 @@ def _fmt(v: Any) -> str:
 
 # ---------------------------------------------------------------- comparators
 
-def _cmp_weight(a: Any, b: Any, critical_pct: float = 5.0,
-                warn_pct: float = 1.0) -> tuple[str, str] | None:
-    """Return (severity, message) or None if both missing."""
-    fa, fb = _to_float(a), _to_float(b)
-    if fa is None and fb is None:
-        return None
-    if fa is None or fb is None:
-        return None  # one-sided absence (often the RC omits a field) is not a discrepancy
-    base = max(abs(fa), abs(fb), 1.0)
-    delta_pct = abs(fa - fb) / base * 100.0
-    if delta_pct > critical_pct:
-        return (CRIT, f"Δ {delta_pct:.1f}%")
-    if delta_pct >= warn_pct:
-        return (WARN, f"Δ {delta_pct:.1f}%")
-    if delta_pct > 0.0:
-        return (INFO, f"Δ {delta_pct:.1f}%")
-    return (INFO, "match")
-
-
-def _cmp_overage_weight(a: Any, b: Any, threshold_pct: float = 10.0) -> tuple[str, str] | None:
-    """BOL↔RC weight: only flag when BOL > RC by ≥ threshold%. BOL < RC is OK."""
+def _cmp_overage_weight(a: Any, b: Any, threshold_lbs: float = 600.0) -> tuple[str, str] | None:
+    """Weight vs RC: only flag when the doc weight EXCEEDS the RC's by more than
+    `threshold_lbs`. Under the RC weight is never a problem, and a 500–600 lbs
+    overage is normal scale variance — only over by > threshold → critical
+    (held for manual review)."""
     fa, fb = _to_float(a), _to_float(b)
     if fa is None and fb is None:
         return None
     if fa is None or fb is None:
         return None  # one-sided absence (often the RC omits a field) is not a discrepancy
     if fa <= fb:
-        return (INFO, "bol≤rc ok")
-    base = max(abs(fb), 1.0)
-    delta_pct = (fa - fb) / base * 100.0
-    if delta_pct >= threshold_pct:
-        return (CRIT, f"bol>rc Δ {delta_pct:.1f}%")
-    return (INFO, f"bol>rc Δ {delta_pct:.1f}%")
-
-
-def _cmp_overage_int(a: Any, b: Any, threshold_pct: float = 10.0) -> tuple[str, str] | None:
-    """BOL↔RC pieces: only flag when BOL > RC by ≥ threshold%. BOL < RC is OK."""
-    ia, ib = _to_int(a), _to_int(b)
-    if ia is None and ib is None:
-        return None
-    if ia is None or ib is None:
-        return None  # one-sided absence (often the RC omits a field) is not a discrepancy
-    if ia <= ib:
-        return (INFO, "bol≤rc ok")
-    base = max(abs(ib), 1)
-    delta_pct = (ia - ib) / base * 100.0
-    if delta_pct >= threshold_pct:
-        return (CRIT, f"bol>rc Δ {ia - ib:+d} ({delta_pct:.1f}%)")
-    return (INFO, f"bol>rc Δ {ia - ib:+d}")
+        return (INFO, "≤ rc ok")
+    over = fa - fb
+    if over > threshold_lbs:
+        return (CRIT, f"over rc by {over:,.0f} lbs")
+    return (INFO, f"over rc by {over:,.0f} lbs (tolerated)")
 
 
 def _cmp_money(a: Any, b: Any, critical_abs: float = 1.0,
@@ -232,18 +199,6 @@ def _cmp_date_late_only(a: Any, b: Any, critical_days: int = 1) -> tuple[str, st
     return (WARN, f"{delta_days:+d}d late")
 
 
-def _cmp_int(a: Any, b: Any) -> tuple[str, str] | None:
-    ia, ib = _to_int(a), _to_int(b)
-    if ia is None and ib is None:
-        return None
-    if ia is None or ib is None:
-        return None  # one-sided absence (often the RC omits a field) is not a discrepancy
-    if ia != ib:
-        delta = ia - ib
-        return (CRIT if abs(delta) > 0 else INFO, f"Δ {delta:+d}")
-    return (INFO, "match")
-
-
 def _cmp_str(a: Any, b: Any, severity_on_diff: str = WARN) -> tuple[str, str] | None:
     na, nb = _norm_str(a), _norm_str(b)
     if na is None and nb is None:
@@ -259,9 +214,9 @@ def _cmp_str(a: Any, b: Any, severity_on_diff: str = WARN) -> tuple[str, str] | 
 
 
 def _cmp_ditat_qty(a: Any, b: Any, inner) -> tuple[str, str] | None:
-    """Ditat↔RC weight/pieces: some tenants never enter these in Ditat, so a
-    Ditat 0/None isn't a real discrepancy — it's a not-entered field. Downgrade
-    to WARN when Ditat is empty but the RC has a value; otherwise defer to `inner`.
+    """Ditat↔RC weight: some tenants never enter it in Ditat, so a Ditat 0/None
+    isn't a real discrepancy — it's a not-entered field. Downgrade to WARN when
+    Ditat is empty but the RC has a value; otherwise defer to `inner`.
     """
     fa = _to_float(a)
     if fa is None or fa == 0:
@@ -271,9 +226,18 @@ def _cmp_ditat_qty(a: Any, b: Any, inner) -> tuple[str, str] | None:
     return inner(a, b)
 
 
+def _norm_load_id(v: Any) -> Optional[str]:
+    """Normalized identifier: junk trailing zero-suffixes like "-0" are dropped,
+    so "122300-0" and "122300" compare equal."""
+    s = _norm_str(v)
+    if s is None:
+        return None
+    return re.sub(r"-0+$", "", s) or s
+
+
 def _cmp_id(a: Any, b: Any) -> tuple[str, str] | None:
-    """Identifier compare: any diff is critical."""
-    na, nb = _norm_str(a), _norm_str(b)
+    """Identifier compare: any diff is critical (after "-0" suffix stripping)."""
+    na, nb = _norm_load_id(a), _norm_load_id(b)
     if na is None and nb is None:
         return None
     if na is None or nb is None:
@@ -349,17 +313,14 @@ def diff_bol_rc(bol: Optional[dict], rc: Optional[dict], rules: dict) -> list[di
         return out
     pair = "BOL↔RC"
     cmp_w = partial(_cmp_overage_weight,
-                    threshold_pct=rules["bol_rc_overage"]["weight_threshold_pct"])
-    cmp_p = partial(_cmp_overage_int,
-                    threshold_pct=rules["bol_rc_overage"]["pieces_threshold_pct"])
-    # Only deterministic numeric checks here. bol_number not compared (RC has
+                    threshold_lbs=rules["weight_overage"]["threshold_lbs"])
+    # Only deterministic numeric checks here. Pieces intentionally NOT compared —
+    # the client only cares about weight problems. bol_number not compared (RC has
     # none); dates → diff_dates; commodity + locations are semantic → judged by
     # the LLM (diff_commodity / diff_locations).
     _emit(out, pair, "weight_lbs",
           _doc_get(bol, "weight_lbs", "weight"), _doc_get(rc, "weight_lbs", "weight"),
           partial(_rc_cmp, inner=cmp_w))
-    _emit(out, pair, "pieces",
-          _doc_get(bol, "pieces"), _doc_get(rc, "pieces"), partial(_rc_cmp, inner=cmp_p))
     return out
 
 
@@ -392,22 +353,19 @@ def diff_ditat_rc(ditat: Optional[dict], rc: Optional[dict], rules: dict) -> lis
     if not ditat or not rc:
         return out
     pair = "Ditat↔RC"
-    cmp_weight = partial(_cmp_weight,
-                         critical_pct=rules["weight_ditat_rc"]["critical_pct"],
-                         warn_pct=rules["weight_ditat_rc"]["warn_pct"])
+    cmp_weight = partial(_cmp_overage_weight,
+                         threshold_lbs=rules["weight_overage"]["threshold_lbs"])
     cmp_money = partial(_cmp_money,
                         critical_abs=rules["money"]["critical_abs"],
                         critical_pct=rules["money"]["critical_pct"])
     # bol_number + equipment_type NOT compared (RC has no BOL#; trailer wording
-    # noise). Locations are semantic → diff_locations (LLM).
+    # noise). total_pieces NOT compared — client only cares about weight problems.
+    # Locations are semantic → diff_locations (LLM).
     _emit(out, pair, "load_number",
           ditat.get("load_number"), _doc_get(rc, "load_number"), partial(_rc_cmp, inner=_cmp_id))
     _emit(out, pair, "total_weight_lbs",
           ditat.get("total_weight_lbs"), _doc_get(rc, "weight_lbs", "weight"),
           partial(_cmp_ditat_qty, inner=cmp_weight))
-    _emit(out, pair, "total_pieces",
-          ditat.get("total_pieces"), _doc_get(rc, "pieces"),
-          partial(_cmp_ditat_qty, inner=_cmp_int))
     _emit(out, pair, "revenue_vs_rate",
           ditat.get("total_revenue"), _doc_get(rc, "agreed_rate", "rate"),
           partial(_rc_cmp, inner=cmp_money))
