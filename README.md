@@ -138,8 +138,7 @@ Cross-checks run in Python with tolerances from [scripts/rules.yaml](scripts/rul
 
 | Field type | Critical (`ISSUES`) | Warning (`WARN`) |
 |---|---|---|
-| Weight (Ditat↔RC) | Δ > 5 % | 1–5 % |
-| Weight/pieces (BOL↔RC) | BOL over RC by ≥ 10 % | — |
+| Weight (BOL↔RC and Ditat↔RC) | Over RC by > 600 lbs (under RC or ≤600 lbs over is OK; pieces not checked) | — |
 | Dates | Δ > 1 day | 0 < Δ ≤ 1 day |
 | Money (rate vs revenue) | Δ > $1.00 or > 1 % | — |
 | BOL / load numbers | Any mismatch | Missing on one side |

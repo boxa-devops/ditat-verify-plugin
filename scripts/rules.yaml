@@ -4,15 +4,12 @@
 # to the built-in default (see scripts/ditat/rules.py), so a partial file is OK.
 # Severities are one of: critical | warn | info.
 
-# Ditat record vs Rate Confirmation — total weight tolerance.
-weight_ditat_rc:
-  critical_pct: 5.0   # |Δ| above this % → critical
-  warn_pct: 1.0       # |Δ| at/above this % (but ≤ critical) → warn
-
-# BOL vs RC overage — only flag when BOL EXCEEDS RC (under is fine).
-bol_rc_overage:
-  weight_threshold_pct: 30.0   # BOL weight over RC by ≥ this % → critical (≤30% tolerated)
-  pieces_threshold_pct: 10.0   # BOL pieces over RC by ≥ this % → critical
+# Weight vs RC (applies to BOL↔RC and Ditat↔RC) — one-directional:
+# under the RC weight is never flagged; a 500–600 lbs overage is normal.
+# Only weight OVER the RC by more than threshold_lbs → critical (manual review).
+# Pieces/quantity are NOT checked at all — only weight matters.
+weight_overage:
+  threshold_lbs: 600
 
 # Revenue (Ditat) vs agreed rate (RC).
 money:

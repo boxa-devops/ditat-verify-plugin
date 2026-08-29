@@ -16,8 +16,10 @@ from typing import Any
 log = logging.getLogger("ditat")
 
 DEFAULTS: dict[str, Any] = {
-    "weight_ditat_rc": {"critical_pct": 5.0, "warn_pct": 1.0},
-    "bol_rc_overage": {"weight_threshold_pct": 30.0, "pieces_threshold_pct": 10.0},
+    # Weight vs RC (BOL↔RC and Ditat↔RC): one-directional — under RC is never a
+    # problem; over RC by ≤ threshold_lbs is normal scale variance; over by more
+    # → critical (manual review). Pieces are not checked at all.
+    "weight_overage": {"threshold_lbs": 600.0},
     "money": {"critical_abs": 1.0, "critical_pct": 1.0},
     "date": {"critical_days": 1},
     # Read by diff.py to detect an unbilled accessorial when the RC is silent but

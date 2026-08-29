@@ -71,15 +71,15 @@ class TestVerdicts(unittest.TestCase):
         r = diff.run_diff(_DITAT_OK, _shipment(bol=_BOL_OK, pod=_POD_OK))
         self.assertEqual(r["verdict"], "RC MISSING")
 
-    def test_bol_weight_40pct_over_rc_is_critical(self):
-        bol = dict(_BOL_OK, weight_lbs=56000)  # bol > rc by 40% (> 30% threshold)
+    def test_bol_weight_over_rc_beyond_600lbs_is_critical(self):
+        bol = dict(_BOL_OK, weight_lbs=40700)  # +700 lbs > 600 lbs tolerance
         r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
         self.assertEqual(r["verdict"], "ISSUES")
         self.assertTrue(any(f["field"] == "weight_lbs" and f["pair"] == "BOL↔RC"
                             for f in r["critical"]))
 
-    def test_bol_weight_25pct_over_rc_is_ok(self):
-        bol = dict(_BOL_OK, weight_lbs=50000)  # bol > rc by 25% — below 30% threshold
+    def test_bol_weight_over_rc_within_600lbs_is_ok(self):
+        bol = dict(_BOL_OK, weight_lbs=40600)  # +600 lbs — at tolerance, normal
         r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
         self.assertEqual(r["verdict"], "OK")
 
@@ -90,17 +90,12 @@ class TestVerdicts(unittest.TestCase):
         self.assertFalse(any(f["field"] == "weight_lbs" and f["pair"] == "BOL↔RC"
                              for f in r["critical"] + r["warn"]))
 
-    def test_bol_pieces_under_rc_is_ok(self):
-        bol = dict(_BOL_OK, pieces=10)  # rc=20, bol<rc
+    def test_bol_pieces_not_compared(self):
+        # Pieces are dropped entirely — only weight problems matter.
+        bol = dict(_BOL_OK, pieces=99)  # rc=20, wildly off — still no finding
         r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
-        self.assertFalse(any(f["field"] == "pieces" and f["pair"] == "BOL↔RC"
-                             for f in r["critical"] + r["warn"]))
-
-    def test_bol_pieces_over_rc_by_50pct_is_critical(self):
-        bol = dict(_BOL_OK, pieces=30)  # rc=20, +50%
-        r = diff.run_diff(_DITAT_OK, _shipment(rc=_RC_OK, bol=bol, pod=_POD_OK))
-        self.assertTrue(any(f["field"] == "pieces" and f["pair"] == "BOL↔RC"
-                            for f in r["critical"]))
+        self.assertFalse(any(f["field"] == "pieces"
+                             for f in r["critical"] + r["warn"] + r["info"]))
 
     def test_delivery_3d_late_is_critical(self):
         pod = dict(_POD_OK, delivery_date="2026-05-06")  # +3d
@@ -143,24 +138,34 @@ class TestVerdicts(unittest.TestCase):
                             for f in r["critical"]))
 
 
-    def test_ditat_zero_weight_pieces_is_warn_not_critical(self):
-        # Tenant never enters weight/pieces in Ditat → 0. RC has real values.
+    def test_ditat_zero_weight_is_warn_not_critical(self):
+        # Tenant never enters weight in Ditat → 0. RC has a real value.
         # Should be WARN ("Ditat not entered"), not a critical discrepancy.
-        ditat = dict(_DITAT_OK, total_weight_lbs=0, total_pieces=0)
+        ditat = dict(_DITAT_OK, total_weight_lbs=0)
         r = diff.run_diff(ditat, _shipment(rc=_RC_OK, bol=_BOL_OK, pod=_POD_OK))
-        self.assertFalse(any(f["pair"] == "Ditat↔RC" and f["field"] in
-                             ("total_weight_lbs", "total_pieces")
+        self.assertFalse(any(f["pair"] == "Ditat↔RC" and f["field"] == "total_weight_lbs"
                              for f in r["critical"]))
         warn_fields = {f["field"] for f in r["warn"] if f["pair"] == "Ditat↔RC"}
         self.assertIn("total_weight_lbs", warn_fields)
-        self.assertIn("total_pieces", warn_fields)
 
-    def test_ditat_real_weight_still_compares(self):
-        # When Ditat DOES carry weight, a big gap is still critical.
-        ditat = dict(_DITAT_OK, total_weight_lbs=20000)  # RC=40000 → 50% off
+    def test_ditat_pieces_not_compared(self):
+        ditat = dict(_DITAT_OK, total_pieces=99)  # rc=20 — still no finding
+        r = diff.run_diff(ditat, _shipment(rc=_RC_OK, bol=_BOL_OK, pod=_POD_OK))
+        self.assertFalse(any(f["field"] == "total_pieces"
+                             for f in r["critical"] + r["warn"] + r["info"]))
+
+    def test_ditat_weight_over_rc_beyond_600lbs_is_critical(self):
+        ditat = dict(_DITAT_OK, total_weight_lbs=41000)  # +1,000 lbs over RC
         r = diff.run_diff(ditat, _shipment(rc=_RC_OK, bol=_BOL_OK, pod=_POD_OK))
         self.assertTrue(any(f["pair"] == "Ditat↔RC" and f["field"] == "total_weight_lbs"
                             for f in r["critical"]))
+
+    def test_ditat_weight_under_rc_is_ok(self):
+        # Under the RC weight is never a problem (one-directional check).
+        ditat = dict(_DITAT_OK, total_weight_lbs=20000)  # RC=40000
+        r = diff.run_diff(ditat, _shipment(rc=_RC_OK, bol=_BOL_OK, pod=_POD_OK))
+        self.assertFalse(any(f["pair"] == "Ditat↔RC" and f["field"] == "total_weight_lbs"
+                             for f in r["critical"] + r["warn"]))
 
     def test_amazon_rc_missing_is_ok(self):
         ditat = dict(_DITAT_OK, customer="Amazon Logistics LLC")
@@ -454,14 +459,26 @@ class TestDeliveryAndCompleteness(unittest.TestCase):
 class TestComparators(unittest.TestCase):
 
     def test_weight_comparator_returns_none_when_both_absent(self):
-        self.assertIsNone(diff._cmp_weight(None, None))
+        self.assertIsNone(diff._cmp_overage_weight(None, None))
 
     def test_weight_missing_one_side_not_flagged(self):
-        self.assertIsNone(diff._cmp_weight(None, 100))
-        self.assertIsNone(diff._cmp_weight(100, None))
+        self.assertIsNone(diff._cmp_overage_weight(None, 100))
+        self.assertIsNone(diff._cmp_overage_weight(100, None))
 
     def test_id_mismatch_is_critical(self):
         sev, _ = diff._cmp_id("A", "B")
+        self.assertEqual(sev, "critical")
+
+    def test_id_trailing_zero_suffix_stripped(self):
+        # "122300-0" and "122300" are the same load number.
+        sev, msg = diff._cmp_id("122300-0", "122300")
+        self.assertEqual(sev, "info")
+        self.assertEqual(msg, "match")
+        sev, _ = diff._cmp_id("122300-00", "122300-0")
+        self.assertEqual(sev, "info")
+
+    def test_id_nonzero_suffix_still_mismatch(self):
+        sev, _ = diff._cmp_id("122300-1", "122300")
         self.assertEqual(sev, "critical")
 
     def test_str_fuzzy_match(self):

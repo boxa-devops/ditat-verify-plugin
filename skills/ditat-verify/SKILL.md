@@ -184,7 +184,7 @@ The helper merges atomically (last-write-wins per shipment_key). The skeleton's 
 | pickup_location {city, state}   | delivery_date                  | weight_received_lbs  |
 | delivery_location {city, state} | weight_lbs                     | damages_notes        |
 | commodity                       | pieces                         | **arrival_time**     |
-| weight_lbs, pieces              | commodity, po_numbers, hazmat  | **departure_time**   |
+| weight_lbs                      | commodity, po_numbers, hazmat  | **departure_time**   |
 | detention_rate ($/hr)           | **pages_present/expected**     | **pages_present/expected** |
 | detention_free_hrs              |                                |                      |
 | detention_max_hrs               |                                |                      |
@@ -270,8 +270,7 @@ The helper:
 | Docs          | pages                          | BOL/POD `pages_expected > pages_present` (e.g. "1 of 11" but 1 uploaded) → critical |
 | RC-policy     | detention                      | RC states detention terms → accepted (no flag). RC silent **and** in/out wait (pickup or delivery) > 2h free **+ 30 min grace** → critical (minor overrun ≤30 min past free = not detention) |
 | RC-policy     | layover                        | RC states layover terms → accepted (no flag). RC silent **and** in/out wait ≥ 5h → critical |
-| BOL↔RC        | weight_lbs                     | bol ≤ rc → OK; bol > rc by **≥30%** → critical; below 30% → info (tolerated) |
-| BOL↔RC        | pieces                         | bol ≤ rc → OK; bol > rc by ≥10% → critical; below 10% → info           |
+| BOL↔RC        | weight_lbs                     | bol ≤ rc → OK (under is never a problem); bol over rc by **> 600 lbs** → critical (manual review); ≤600 lbs over = normal scale variance |
 | Dates         | pickup_date                    | resolved date **POD → BOL → Ditat trip** vs RC; Δ > 1d → critical; Δ = 1d → warn. Both sides must have a date (one-sided absence = no flag). |
 | Dates         | delivery_date                  | **late-only** — actual (POD→BOL→Ditat) delivery vs RC appointment; late by >1d → critical, 1d → warn. **Early / on-time delivery is never flagged.** |
 | BOL↔RC        | commodity                      | **judged by YOU (LLM)** — set `commodity_mismatch: true` only when BOL & RC are genuinely different freight; relayed as a warn. Python does not compare commodity text. |
@@ -279,14 +278,15 @@ The helper:
 | POD↔RC        | bol_number                     | **skipped when BOL doc present** — BOL↔POD covers it                   |
 | POD↔RC        | weight_received, pieces_received | **dropped** — POD quantities diverge on partial deliveries           |
 | POD↔RC        | damages_notes                  | any damages → warn                                                     |
-| Ditat↔RC      | total_weight_lbs               | weight Δ > 5% → critical; ≥1% → warn (Ditat 0/empty → warn "not entered") |
-| Ditat↔RC      | total_pieces                   | any diff → critical (Ditat 0/empty → warn "not entered")              |
-| Ditat↔RC      | load_number                    | id mismatch → critical                                                 |
+| Ditat↔RC      | total_weight_lbs               | same one-directional rule: over rc by > 600 lbs → critical; under or ≤600 over = OK (Ditat 0/empty → warn "not entered") |
+| Ditat↔RC      | load_number                    | id mismatch → critical; trailing junk suffixes like `-0` are stripped first (`122300-0` = `122300`) |
 | Ditat↔RC      | pickup_location, delivery_location | city + state only via normalized compare                          |
 | Ditat↔RC      | revenue_vs_rate                | money Δ > $1 → critical                                                |
 | BOL↔POD       | bol_number                     | id mismatch → critical (weight + pieces dropped — POD unreliable)      |
 
 **Not compared** (intentionally removed — produced noise, no value):
+- **Pieces / quantity — dropped everywhere** (BOL↔RC, Ditat↔RC). The client only
+  cares about weight problems; piece counts are never checked.
 - BOL↔RC `bol_number` — the RC carries no BOL number.
 - Ditat↔RC `bol_number`, `equipment_type` — RC has no BOL number; "53Van" vs "Dry Van 53'" is the same trailer.
 - **One-sided absence (asymmetric):** a field missing in the **RC** but present on
